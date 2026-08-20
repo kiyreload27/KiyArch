@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+
+# Read-only hardware inventory. Classification is deliberately heuristic; a
+# future installer must confirm all hardware and disk choices.
+set -u
+
+BOLD="\033[1m"; CYAN="\033[36m"; DIM="\033[2m"; GREEN="\033[32m"; RESET="\033[0m"
+JSON_MODE=0
+case "${1:-}" in
+    --json|-j) JSON_MODE=1 ;;
+    "") ;;
+    --help|-h) printf 'Usage: kiyarch-hw [--json]\n'; exit 0 ;;
+    *) printf 'Usage: kiyarch-hw [--json]\n' >&2; exit 2 ;;
+esac
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+read_value() {
+    local path="$1" value=""
+    if [[ -r "$path" ]]; then IFS= read -r value < "$path" || true; fi
+    printf '%s' "$value"
+}
+
+first_nonempty() {
+    local value
+    for value in "$@"; do
+        if [[ -n "$value" && "$value" != None && "$value" != unknown ]]; then
+            printf '%s' "$value"; return
+        fi
+    done
+}
+
+json_escape() {
+    local input="$1" output="" character ordinal index
+    for ((index=0; index<${#input}; index++)); do
+        character="${input:index:1}"
+        case "$character" in
+            '\\') output+='\\\\' ;;
+            '"') output+='\\"' ;;
+            $'\n') output+='\\n' ;;
+            $'\r') output+='\\r' ;;
+            $'\t') output+='\\t' ;;
+            *)
+                printf -v ordinal '%d' "'${character}"
+                if ((ordinal < 32)); then printf -v character '\\u%04x' "$ordinal"; fi
+                output+="$character"
+                ;;
+        esac
+    done
+    printf '%s' "$output"
+}
+
+json_string() { printf '"%s"' "$(json_escape "$1")"; }
+
+json_array_strings() {
+    local first=1 value
+    printf '['
+    for value in "$@"; do
+        ((first)) || printf ','; first=0; json_string "$value"
+    done
+    printf ']'
+}
+
+json_bool() {
+    [[ "$1" == yes || "$1" == true || "$1" == 1 ]] && printf true || printf false
+}
+
+section() {
+    local title="$1"
+    printf '\n%b%s%b\n' "$BOLD$CYAN" "$title" "$RESET"
+    printf '%*s\n' "${#title}" '' | tr ' ' '-'
+}
+
+item() { printf '  %-22s %s\n' "$1" "$2"; }
+
+# System -------------------------------------------------------------------
+ARCH="$(uname -m 2>/dev/null || printf unknown)"
+[[ -d /sys/firmware/efi ]] && FIRMWARE=uefi || FIRMWARE=legacy_bios
+VIRT=none; VM_TECHNOLOGY=none
+if have systemd-detect-virt; then
+    VIRT="$(systemd-detect-virt 2>/dev/null || printf none)"
+    VM_TECHNOLOGY="$(systemd-detect-virt --vm 2>/dev/null || printf none)"
+fi
+if [[ "$VM_TECHNOLOGY" != none && -n "$VM_TECHNOLOGY" ]]; then
+    MACHINE_TYPE=virtual_machine
+elif [[ "$VIRT" != none && -n "$VIRT" ]]; then
+    MACHINE_TYPE=container
+else
+    MACHINE_TYPE=physical
+fi
+MANUFACTURER="$(first_nonempty \
+    "$(read_value /sys/class/dmi/id/sys_vendor)" \
+    "$(read_value /sys/class/dmi/id/board_vendor)" \
+    "$(have dmidecode && dmidecode -s system-manufacturer 2>/dev/null || true)" unknown)"
+PRODUCT="$(first_nonempty \
+    "$(read_value /sys/class/dmi/id/product_name)" \
+    "$(read_value /sys/class/dmi/id/board_name)" \
+    "$(have dmidecode && dmidecode -s system-product-name 2>/dev/null || true)" unknown)"
+CHASSIS="$(read_value /sys/class/dmi/id/chassis_type)"
+BATTERY_PATHS=()
+for path in /sys/class/power_supply/BAT*; do [[ -e "$path" ]] && BATTERY_PATHS+=("$path"); done
+case "$CHASSIS" in
+    8|9|10|14|30) FORM_FACTOR=laptop ;;
+    3|4|5|6|7|13) FORM_FACTOR=desktop ;;
+    *) ((${#BATTERY_PATHS[@]})) && FORM_FACTOR=laptop || FORM_FACTOR=unknown ;;
+esac
+
+# CPU ----------------------------------------------------------------------
+CPU_VENDOR_ID="$(awk -F: '/^vendor_id[[:space:]]*:/ {gsub(/^[[:space:]]+/,"",$2);print $2;exit}' /proc/cpuinfo 2>/dev/null)"
+CPU_MODEL="$(awk -F: '/^model name[[:space:]]*:/ {gsub(/^[[:space:]]+/,"",$2);print $2;exit}' /proc/cpuinfo 2>/dev/null)"
+CPU_MODEL="${CPU_MODEL:-$(awk -F: '/^Hardware[[:space:]]*:/ {gsub(/^[[:space:]]+/,"",$2);print $2;exit}' /proc/cpuinfo 2>/dev/null)}"
+CPU_MODEL="${CPU_MODEL:-unknown}"; CPU_VENDOR=unknown; MICROCODE_PACKAGE=none
+case "$CPU_VENDOR_ID" in
+    GenuineIntel) CPU_VENDOR=Intel; MICROCODE_PACKAGE=intel-ucode ;;
+    AuthenticAMD) CPU_VENDOR=AMD; MICROCODE_PACKAGE=amd-ucode ;;
+esac
+THREADS="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf unknown)"
+if [[ "$THREADS" =~ ^[0-9]+$ ]]; then THREADS_JSON="$THREADS"; else THREADS_JSON="$(json_string "$THREADS")"; fi
+
+# Graphics -----------------------------------------------------------------
+declare -a GPU_JSON_ITEMS=() GPU_HUMAN_LINES=() GRAPHICS_NOTES=()
+GPU_INTEL=0; GPU_AMD=0; GPU_NVIDIA=0; GPU_VIRTUAL=0
+if have lspci; then
+    while IFS= read -r line; do
+        [[ "$line" =~ ^([^[:space:]]+)[[:space:]]+([^:]+):[[:space:]]*(.*)$ ]] || continue
+        address="${BASH_REMATCH[1]}"; class="${BASH_REMATCH[2]}"; description="${BASH_REMATCH[3]}"
+        lower="${line,,}"; gpu_text="${description,,}"; vendor=unknown; hardware_class=unknown
+        if [[ "$gpu_text" == *nvidia* ]]; then
+            vendor=NVIDIA; hardware_class=nvidia; GPU_NVIDIA=1
+        elif [[ "$gpu_text" == *intel* ]]; then
+            vendor=Intel; hardware_class=intel_integrated; GPU_INTEL=1
+        elif [[ "$gpu_text" == *advanced\ micro\ devices* || "$gpu_text" == *amd* || "$gpu_text" == *ati\ technologies* || "$gpu_text" == *radeon* ]]; then
+            vendor=AMD; GPU_AMD=1
+            [[ "$lower" =~ radeon[[:space:]]+(rx|pro|firepro|hd)|radeon[[:space:]]+r[579] ]] && hardware_class=amd_discrete || hardware_class=amd_integrated
+        fi
+        if [[ "$lower" == *vmware* || "$lower" == *virtualbox* || "$lower" == *virtio* || "$lower" == *qxl* || "$lower" == *virtual* ]]; then
+            vendor=Virtual; hardware_class=virtual; GPU_VIRTUAL=1
+        fi
+        driver="$(lspci -k -s "$address" 2>/dev/null | awk -F: '/Kernel driver in use:/ {gsub(/^[[:space:]]+/,"",$2);print $2;exit}')"
+        driver="${driver:-unknown}"
+        GPU_JSON_ITEMS+=("$(printf '{\"id\":%s,\"description\":%s,\"vendor\":%s,\"class\":%s,\"hardware_class\":%s,\"driver\":%s,\"classification\":%s}' \
+            "$(json_string "$address")" "$(json_string "$description")" "$(json_string "$vendor")" \
+            "$(json_string "$class")" "$(json_string "$hardware_class")" "$(json_string "$driver")" "$(json_string heuristic)")")
+        GPU_HUMAN_LINES+=("$vendor / $hardware_class: $description (driver: $driver)")
+    done < <(lspci -Dnn 2>/dev/null | awk '/VGA compatible controller|3D controller|Display controller/')
+fi
+if ((GPU_NVIDIA)); then GRAPHICS_NOTES+=("NVIDIA exact driver selection will be resolved during installation; no blind package assumption is made."); fi
+if ((GPU_INTEL && GPU_NVIDIA)); then GRAPHICS_NOTES+=("Intel + NVIDIA hybrid graphics detected; hybrid choices remain installation-time decisions."); fi
+if ((GPU_AMD && GPU_NVIDIA)); then GRAPHICS_NOTES+=("AMD + NVIDIA hybrid graphics detected; hybrid choices remain installation-time decisions."); fi
+if ((GPU_VIRTUAL)); then GRAPHICS_NOTES+=("A virtual GPU is present; guest-specific graphics handling may be needed."); fi
+
+# Networking ---------------------------------------------------------------
+declare -a NETWORK_JSON_ITEMS=() NETWORK_HUMAN_LINES=()
+for net_path in /sys/class/net/*; do
+    [[ -e "$net_path" ]] || continue
+    name="$(basename "$net_path")"; [[ "$name" == lo ]] && continue
+    type="$(read_value "$net_path/type")"; kind=other
+    if [[ -d "$net_path/wireless" ]]; then kind=wifi
+    elif [[ "$type" == 1 ]]; then kind=ethernet; fi
+    state="$(read_value "$net_path/operstate")"; state="${state:-unknown}"
+    ips=()
+    if have ip; then
+        while IFS= read -r address; do
+            [[ -n "$address" ]] && ips+=("$address")
+        done < <(ip -o -4 addr show dev "$name" scope global 2>/dev/null | awk '{split($4,a,"/");print a[1]}')
+    fi
+    NETWORK_JSON_ITEMS+=("$(printf '{\"name\":%s,\"type\":%s,\"link_state\":%s,\"ipv4\":%s}' \
+        "$(json_string "$name")" "$(json_string "$kind")" "$(json_string "$state")" "$(json_array_strings "${ips[@]}")")")
+    NETWORK_HUMAN_LINES+=("$name ($kind, $state): ${ips[*]:-no IPv4 address}")
+done
+
+# Bluetooth, power, and laptop devices ------------------------------------
+declare -a BLUETOOTH_CONTROLLERS=()
+for path in /sys/class/bluetooth/*; do
+    [[ -e "$path" ]] && BLUETOOTH_CONTROLLERS+=("$(basename "$path")")
+done
+if have rfkill && rfkill list 2>/dev/null | grep -qi bluetooth && ((${#BLUETOOTH_CONTROLLERS[@]} == 0)); then
+    BLUETOOTH_CONTROLLERS+=(rfkill-reported-controller)
+fi
+declare -a BATTERY_JSON_ITEMS=() BATTERY_HUMAN_LINES=()
+for path in "${BATTERY_PATHS[@]}"; do
+    name="$(basename "$path")"; capacity="$(read_value "$path/capacity")"; status="$(read_value "$path/status")"
+    [[ "$capacity" =~ ^[0-9]+$ ]] && capacity_json="$capacity" || capacity_json=null
+    [[ "$capacity" =~ ^[0-9]+$ ]] || capacity=unknown
+    BATTERY_JSON_ITEMS+=("$(printf '{\"name\":%s,\"capacity_percent\":%s,\"status\":%s}' "$(json_string "$name")" "$capacity_json" "$(json_string "${status:-unknown}")")")
+    BATTERY_HUMAN_LINES+=("$name (${capacity}%, ${status:-unknown})")
+done
+declare -a AC_JSON_ITEMS=() AC_HUMAN_LINES=()
+for path in /sys/class/power_supply/*; do
+    [[ -e "$path" ]] || continue
+    type="$(read_value "$path/type")"
+    case "$type" in
+        Mains|USB)
+            name="$(basename "$path")"; online="$(read_value "$path/online")"
+            AC_JSON_ITEMS+=("$(printf '{\"name\":%s,\"type\":%s,\"online\":%s}' "$(json_string "$name")" "$(json_string "$type")" "$(json_bool "$online")")")
+            AC_HUMAN_LINES+=("$name ($type, online: ${online:-unknown})")
+            ;;
+    esac
+done
+declare -a BACKLIGHTS=() TOUCHPADS=()
+for path in /sys/class/backlight/*; do
+    [[ -e "$path" ]] && BACKLIGHTS+=("$(basename "$path")")
+done
+for path in /sys/class/input/*; do
+    [[ -r "$path/device/name" ]] || continue
+    name="$(read_value "$path/device/name")"
+    [[ "${name,,}" == *touchpad* || "${name,,}" == *trackpad* ]] && TOUCHPADS+=("$name")
+done
+
+# Physical disks only. Loop, optical, zram, and other non-disk devices are
+# excluded; removable disks remain visible and are explicitly labelled.
+declare -a STORAGE_JSON_ITEMS=() STORAGE_HUMAN_LINES=()
+if have lsblk; then
+    lsblk_field() {
+        local field="$1" record="$2" expression
+        expression="${field}=\"([^\"]*)\""
+        [[ "$record" =~ $expression ]] && printf '%s' "${BASH_REMATCH[1]}"
+    }
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        device="$(lsblk_field PATH "$record")"; type="$(lsblk_field TYPE "$record")"; transport="$(lsblk_field TRAN "$record")"
+        size="$(lsblk_field SIZE "$record")"; model="$(lsblk_field MODEL "$record")"; rota="$(lsblk_field ROTA "$record")"; removable="$(lsblk_field RM "$record")"; read_only="$(lsblk_field RO "$record")"
+        name="$(basename "$device")"
+        [[ "$type" == disk && "$name" != zram* && -e "/sys/class/block/$name/device" && -n "$device" ]] || continue
+        transport="${transport:-unknown}"; model="${model:-unknown}"; media=unknown
+        [[ "$rota" == 1 ]] && media=rotational; [[ "$rota" == 0 ]] && media=solid_state
+        rotational_json=false; [[ "$rota" == 1 ]] && rotational_json=true
+        readonly_json=false; [[ "$read_only" == 1 ]] && readonly_json=true
+        removable_flag=no; [[ "$removable" == 1 || "$transport" == usb ]] && removable_flag=yes
+        storage_class=other
+        case "$transport" in
+            nvme) storage_class=nvme ;;
+            sata|ata) storage_class=sata ;;
+            usb) storage_class=usb ;;
+        esac
+        STORAGE_JSON_ITEMS+=("$(printf '{\"device\":%s,\"size\":%s,\"model\":%s,\"transport\":%s,\"storage_class\":%s,\"media\":%s,\"rotational\":%s,\"removable\":%s,\"readonly\":%s,\"install_target_candidate\":true}' \
+            "$(json_string "$device")" "$(json_string "$size")" "$(json_string "$model")" "$(json_string "$transport")" "$(json_string "$storage_class")" "$(json_string "$media")" \
+            "$(json_bool "$rotational_json")" "$(json_bool "$removable_flag")" "$(json_bool "$readonly_json")")")
+        STORAGE_HUMAN_LINES+=("$device  $size  $model  [$storage_class, $media, removable: $removable_flag]")
+    done < <(lsblk -dnP -o PATH,TYPE,TRAN,SIZE,MODEL,ROTA,RM,RO 2>/dev/null)
+fi
+
+declare -a WARNINGS=(
+    "Hardware classification is read-only and may be heuristic; installation must confirm every target and driver choice."
+    "No disk was formatted, partitioned, mounted for installation, or modified by this scan."
+)
+((GPU_NVIDIA)) && WARNINGS+=("NVIDIA driver selection is intentionally deferred until installation can inspect the exact GPU and target setup.")
+((${#STORAGE_JSON_ITEMS[@]} == 0)) && WARNINGS+=("No physical install-target disk was detected by the available interfaces.")
+
+print_json() {
+    local first item
+    printf '{\n'
+    printf '  "system":{"architecture":%s,"firmware":%s,"machine_type":%s,"virtualization":%s,"vm_technology":%s,"form_factor":%s,"manufacturer":%s,"product":%s},\n' \
+        "$(json_string "$ARCH")" "$(json_string "$FIRMWARE")" "$(json_string "$MACHINE_TYPE")" "$(json_string "$VIRT")" "$(json_string "$VM_TECHNOLOGY")" "$(json_string "$FORM_FACTOR")" "$(json_string "$MANUFACTURER")" "$(json_string "$PRODUCT")"
+    printf '  "cpu":{"vendor":%s,"vendor_id":%s,"model":%s,"threads":%s,"microcode_package":%s},\n' \
+        "$(json_string "$CPU_VENDOR")" "$(json_string "${CPU_VENDOR_ID:-unknown}")" "$(json_string "$CPU_MODEL")" "$THREADS_JSON" "$(json_string "$MICROCODE_PACKAGE")"
+    printf '  "graphics":['; first=1
+    for item in "${GPU_JSON_ITEMS[@]}"; do ((first)) || printf ','; first=0; printf '%s' "$item"; done
+    printf '],\n  "network":['; first=1
+    for item in "${NETWORK_JSON_ITEMS[@]}"; do ((first)) || printf ','; first=0; printf '%s' "$item"; done
+    printf '],\n'
+    printf '  "bluetooth":{"detected":%s,"controllers":%s},\n' \
+        "$(json_bool "$([[ ${#BLUETOOTH_CONTROLLERS[@]} -gt 0 ]] && printf true || printf false)")" "$(json_array_strings "${BLUETOOTH_CONTROLLERS[@]}")"
+    printf '  "power":{"batteries":['; first=1
+    for item in "${BATTERY_JSON_ITEMS[@]}"; do ((first)) || printf ','; first=0; printf '%s' "$item"; done
+    printf '],"ac_adapters":['; first=1
+    for item in "${AC_JSON_ITEMS[@]}"; do ((first)) || printf ','; first=0; printf '%s' "$item"; done
+    printf '],"backlights":%s,"touchpads":%s},\n' "$(json_array_strings "${BACKLIGHTS[@]}")" "$(json_array_strings "${TOUCHPADS[@]}")"
+    printf '  "storage":['; first=1
+    for item in "${STORAGE_JSON_ITEMS[@]}"; do ((first)) || printf ','; first=0; printf '%s' "$item"; done
+    printf '],\n'
+    printf '  "recommendations":{"cpu_microcode":%s,"graphics_notes":%s,"storage_selection_policy":%s,"warnings":%s}\n' \
+        "$(json_string "$MICROCODE_PACKAGE")" "$(json_array_strings "${GRAPHICS_NOTES[@]}")" \
+        "$(json_string 'Physical disks are candidates only; removable media require explicit confirmation.')" "$(json_array_strings "${WARNINGS[@]}")"
+    printf '}\n'
+}
+
+print_human() {
+    printf '\n%bKIYARCH HARDWARE REPORT%b\nRead-only inventory for safe future installation decisions\n' "$BOLD" "$RESET"
+    section System
+    item Architecture: "$ARCH"; item Firmware: "$FIRMWARE"; item Machine: "$MACHINE_TYPE"
+    item 'Virtualization:' "$VIRT"; item 'VM technology:' "$VM_TECHNOLOGY"; item 'Form factor:' "$FORM_FACTOR"
+    item Manufacturer: "$MANUFACTURER"; item Product: "$PRODUCT"
+    section CPU
+    item Vendor: "$CPU_VENDOR"; item Model: "$CPU_MODEL"; item Threads: "$THREADS"; item Microcode: "$MICROCODE_PACKAGE"
+    section Graphics
+    if ((${#GPU_HUMAN_LINES[@]})); then
+        for value in "${GPU_HUMAN_LINES[@]}"; do printf '  %s\n' "$value"; done
+    else
+        item Adapters: 'Not detected'
+    fi
+    section Networking
+    if ((${#NETWORK_HUMAN_LINES[@]})); then
+        for value in "${NETWORK_HUMAN_LINES[@]}"; do printf '  %s\n' "$value"; done
+    else
+        item Interfaces: 'Not detected'
+    fi
+    section Bluetooth
+    if ((${#BLUETOOTH_CONTROLLERS[@]})); then item Controllers: "${BLUETOOTH_CONTROLLERS[*]}"; else item Controllers: 'Not detected'; fi
+    section 'Laptop hardware'
+    if ((${#BATTERY_HUMAN_LINES[@]})); then for value in "${BATTERY_HUMAN_LINES[@]}"; do item Battery: "$value"; done; else item Battery: 'Not detected'; fi
+    if ((${#AC_HUMAN_LINES[@]})); then for value in "${AC_HUMAN_LINES[@]}"; do item 'AC adapter:' "$value"; done; else item 'AC adapter:' 'Not detected'; fi
+    item Backlights: "${BACKLIGHTS[*]:-Not detected}"; item Touchpads: "${TOUCHPADS[*]:-Not detected}"
+    section 'Physical install-target disks'
+    if ((${#STORAGE_HUMAN_LINES[@]})); then
+        for value in "${STORAGE_HUMAN_LINES[@]}"; do printf '  %s\n' "$value"; done
+    else
+        item Disks: 'None detected (loop and virtual memory devices are excluded)'
+    fi
+    section 'KiyArch recommendations and limits'
+    item 'CPU microcode:' "$MICROCODE_PACKAGE"
+    for value in "${GRAPHICS_NOTES[@]}" "${WARNINGS[@]}"; do printf '  - %s\n' "$value"; done
+    printf '\n%bHardware scan complete. No hardware or disk changes were made.%b\n%bJSON is available with: kiyarch-hw --json%b\n\n' "$GREEN$BOLD" "$RESET" "$DIM" "$RESET"
+}
+
+if ((JSON_MODE)); then print_json; else print_human; fi

@@ -19,6 +19,9 @@ echo "Work:     $WORK_DIR"
 echo "Output:   $OUT_DIR"
 echo
 
+echo "Validating KiyArch profile..."
+"$ROOT_DIR/scripts/validate-profile.sh"
+
 if [[ -d "$WORK_DIR" ]]; then
     echo "Removing previous build workspace..."
     sudo rm -rf "$WORK_DIR"

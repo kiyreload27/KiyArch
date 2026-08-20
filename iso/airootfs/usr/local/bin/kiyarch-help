@@ -4,18 +4,18 @@ cat <<'HELP'
 
 KiyArch Live Environment
 
-Available KiyArch commands:
+Available commands:
 
   kiyarch-help       Show this help screen
+  kiyarch-hw         Detect hardware and installation recommendations
+  kiyarch-ssh        Show live SSH status and connection details
 
 Coming soon:
 
-  kiyarch-install    Launch the KiyArch installer
-  kiyarch-hw         Detect system hardware
   kiyarch-network    Configure networking
+  kiyarch-install    Launch the KiyArch installer
 
-Project status:
-  KiyArch 0.0.1
-  Development build
+KiyArch 0.0.1
+Development build
 
 HELP

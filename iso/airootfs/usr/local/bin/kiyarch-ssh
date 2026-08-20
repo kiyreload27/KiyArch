@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+
+set -u
+
+readonly SCRIPT_NAME="kiyarch-ssh"
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+service_state() {
+    if have systemctl; then
+        systemctl is-active sshd 2>/dev/null || true
+    else
+        printf '%s\n' "unavailable"
+    fi
+}
+
+is_listening() {
+    if have ss; then
+        ss -H -ltn 'sport = :22' 2>/dev/null | grep -q .
+    elif have netstat; then
+        netstat -ltn 2>/dev/null | awk 'NR > 2 && $4 ~ /(^|:)22$/ { found=1 } END { exit !found }'
+    else
+        return 1
+    fi
+}
+
+ipv4_addresses() {
+    if ! have ip; then
+        return 0
+    fi
+
+    ip -o -4 addr show up scope global 2>/dev/null \
+        | awk '{ split($4, address, "/"); print address[1] }'
+}
+
+effective_value() {
+    local key="$1"
+    local value=""
+
+    if have sshd; then
+        value="$(sshd -T 2>/dev/null | awk -v wanted="${key,,}" '$1 == wanted { print $2; exit }')"
+    fi
+
+    # sshd -T can be unavailable before host keys are generated. The live
+    # profile's drop-ins still provide a useful, non-sensitive fallback.
+    if [[ -z "$value" ]]; then
+        for config in /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config; do
+            [[ -r "$config" ]] || continue
+            value="$(awk -v wanted="${key,,}" 'tolower($1) == wanted && $1 !~ /^[[:space:]]*#/ { print $2; exit }' "$config")"
+            [[ -n "$value" ]] && break
+        done
+    fi
+
+    printf '%s\n' "${value:-unknown}"
+}
+
+authorized_key_count() {
+    local authorized_keys="/root/.ssh/authorized_keys"
+
+    [[ -f "$authorized_keys" ]] || {
+        printf '0\n'
+        return
+    }
+
+    # Count key records without exposing their contents. Comments and blank
+    # lines are ignored; the key material itself is never printed.
+    awk '!/^[[:space:]]*#/ && NF >= 2 && $1 ~ /^(ssh-|ecdsa-|sk-|rsa-sha2-)/ { count++ } END { print count + 0 }' \
+        "$authorized_keys" 2>/dev/null
+}
+
+show_help() {
+    cat <<'HELP'
+kiyarch-ssh - inspect the KiyArch live SSH service
+
+Usage:
+  kiyarch-ssh              Show SSH status and LAN connection details
+  kiyarch-ssh status       Same as the default command
+  kiyarch-ssh start        Start sshd for this live session
+  kiyarch-ssh stop         Stop sshd for this live session
+  kiyarch-ssh restart      Restart sshd for this live session
+
+Authentication is public-key only by default. This helper never creates a
+password or enables password authentication automatically.
+HELP
+}
+
+service_action() {
+    local action="$1"
+
+    if ! have systemctl; then
+        printf '%s: systemctl is unavailable.\n' "$SCRIPT_NAME" >&2
+        return 1
+    fi
+
+    if systemctl "$action" sshd; then
+        case "$action" in
+            start) printf 'sshd started.\n' ;;
+            stop) printf 'sshd stopped.\n' ;;
+            restart) printf 'sshd restarted.\n' ;;
+        esac
+    else
+        printf '%s: unable to %s sshd.\n' "$SCRIPT_NAME" "$action" >&2
+        return 1
+    fi
+}
+
+show_status() {
+    local state listening auth_root auth_password auth_pubkey auth_empty
+    local keys_file="/root/.ssh/authorized_keys"
+    local addresses
+
+    state="$(service_state)"
+    if is_listening; then
+        listening="yes"
+    else
+        listening="no"
+    fi
+
+    auth_root="$(effective_value permitrootlogin)"
+    auth_password="$(effective_value passwordauthentication)"
+    auth_pubkey="$(effective_value pubkeyauthentication)"
+    auth_empty="$(effective_value permitemptypasswords)"
+    addresses="$(ipv4_addresses || true)"
+
+    printf '\nKiyArch live SSH\n\n'
+    printf '  sshd running:       %s\n' "$state"
+    printf '  Port 22 listening:  %s\n' "$listening"
+    printf '  Hostname:           %s\n' "$(hostname 2>/dev/null || printf 'unknown')"
+    printf '  Root login policy:  %s\n' "$auth_root"
+    printf '  Password auth:      %s\n' "$auth_password"
+    printf '  Pubkey auth:        %s\n' "$auth_pubkey"
+    printf '  Empty passwords:    %s\n' "$auth_empty"
+
+    if [[ -f "$keys_file" ]]; then
+        printf '  authorized_keys:    present\n'
+        printf '  Authorized keys:    %s\n' "$(authorized_key_count)"
+    else
+        printf '  authorized_keys:    absent\n'
+        printf '  Authorized keys:    0\n'
+    fi
+
+    printf '\n  IPv4 addresses suitable for LAN SSH:\n'
+    if [[ -n "$addresses" ]]; then
+        while IFS= read -r address; do
+            [[ -n "$address" ]] || continue
+            printf '    ssh root@%s\n' "$address"
+        done <<< "$addresses"
+    else
+        printf '    none detected\n'
+    fi
+
+    printf '\n  Authentication uses public keys only. Add a key to /root/.ssh/authorized_keys\n'
+    printf '  through your own trusted provisioning process; this helper does not create\n'
+    printf '  passwords or print private key material.\n\n'
+}
+
+main() {
+    local command="${1:-status}"
+
+    case "$command" in
+        status)
+            show_status
+            ;;
+        start|stop|restart)
+            service_action "$command"
+            ;;
+        help|-h|--help)
+            show_help
+            ;;
+        *)
+            printf '%s: unknown command: %s\n\n' "$SCRIPT_NAME" "$command" >&2
+            show_help >&2
+            return 2
+            ;;
+    esac
+}
+
+main "$@"

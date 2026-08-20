@@ -51,6 +51,8 @@ less
 lftp
 libfido2
 libusb-compat
+inetutils
+pciutils
 linux
 linux-atm
 linux-firmware
@@ -128,3 +130,4 @@ xdg-utils
 xfsprogs
 xl2tpd
 zsh
+rfkill
