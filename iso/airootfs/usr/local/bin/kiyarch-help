@@ -8,14 +8,13 @@ Available commands:
 
   kiyarch-help       Show this help screen
   kiyarch-hw         Detect hardware and installation recommendations
+  kiyarch-install    Build a safe, read-only installation plan
+  kiyarch-plan       Validate an exported installation plan
+  kiyarch-execute    Execute a validated 1.1 plan (destructive; explicit confirmations)
+  kiyarch-menu       Open the local tty1 welcome menu
+  kiyarch-network    Show live network status
   kiyarch-ssh        Show live SSH status and connection details
 
-Coming soon:
-
-  kiyarch-network    Configure networking
-  kiyarch-install    Launch the KiyArch installer
-
-KiyArch 0.0.1
-Development build
+KiyArch terminal-first live environment
 
 HELP

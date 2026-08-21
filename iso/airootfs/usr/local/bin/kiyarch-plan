@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+
+# Validate a KiyArch installation plan without requiring a JSON package.
+# If jq or Perl JSON::PP is available, it is used for an additional syntax
+# check; the policy checks below remain the source of truth in the live ISO.
+set -u
+
+RED="\033[31m"; GREEN="\033[32m"; RESET="\033[0m"
+
+usage() {
+    cat <<'USAGE'
+Usage: kiyarch-plan --validate PLAN.json
+
+Validate KiyArch schema 1.0 planner-only or schema 1.1 profile plans. The
+destructive executor accepts only 1.1. This command never changes disks.
+USAGE
+}
+
+fail() { printf '%bERROR:%b %s\n' "$RED" "$RESET" "$1" >&2; exit 1; }
+
+[[ "${1:-}" == --validate && $# == 2 ]] || { usage >&2; exit 2; }
+PLAN_PATH="$2"
+[[ -f "$PLAN_PATH" && -r "$PLAN_PATH" ]] || fail "plan is not a readable regular file: $PLAN_PATH"
+
+if [[ "$(wc -c < "$PLAN_PATH")" =~ ^[0-9]+$ ]] && (( $(wc -c < "$PLAN_PATH") > 1048576 )); then
+    fail 'plan is larger than the 1 MiB planner output limit'
+fi
+if LC_ALL=C od -An -tx1 "$PLAN_PATH" 2>/dev/null | grep -qw '00'; then
+    fail 'plan contains a NUL byte'
+fi
+
+ERRORS=0
+error() { printf '%bERROR:%b %s\n' "$RED" "$RESET" "$1" >&2; ERRORS=$((ERRORS + 1)); }
+
+field_count() {
+    local field="$1" count
+    count="$(LC_ALL=C grep -Ec '^[[:space:]]*"'"$field"'"[[:space:]]*:' "$PLAN_PATH" 2>/dev/null || true)"
+    printf '%s' "$count"
+}
+
+require_field() {
+    local field="$1" count
+    count="$(field_count "$field")"
+    [[ "$count" == 1 ]] || error "required top-level field is missing or repeated: $field"
+}
+
+require_value() {
+    local expression="$1" description="$2"
+    grep -Eq "$expression" "$PLAN_PATH" 2>/dev/null || error "$description"
+}
+
+for field in \
+    schema_version plan_kind source_hardware target_disk firmware_policy \
+    partition_layout filesystem_policy account_configuration desktop_profile \
+    encryption execution warnings unresolved_decisions; do
+    require_field "$field"
+done
+
+SCHEMA_VERSION="$(sed -nE 's/^[[:space:]]*"schema_version"[[:space:]]*:[[:space:]]*"([0-9.]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
+case "$SCHEMA_VERSION" in
+    1.0|1.1) ;;
+    *) error 'schema_version is not a supported 1.0 or 1.1 value' ;;
+esac
+require_value '^[[:space:]]*"plan_kind"[[:space:]]*:[[:space:]]*"kiyarch_install_plan"[[:space:]]*,[[:space:]]*$' 'plan_kind is not kiyarch_install_plan'
+require_value '"mode"[[:space:]]*:[[:space:]]*"planner_only"' 'execution mode is not planner_only'
+require_value '"executor_enabled"[[:space:]]*:[[:space:]]*false' 'executor_enabled is not false'
+require_value '"mutates_target_disk"[[:space:]]*:[[:space:]]*false' 'mutates_target_disk is not false'
+require_value '"required"[[:space:]]*:[[:space:]]*"uefi"' 'UEFI policy is missing'
+require_value '"partition_table"[[:space:]]*:[[:space:]]*"gpt"' 'GPT policy is missing'
+require_value '"disk_label"[[:space:]]*:[[:space:]]*"gpt"' 'GPT disk layout is missing'
+require_value '"filesystem"[[:space:]]*:[[:space:]]*"fat32"' 'FAT32 EFI filesystem is missing'
+require_value '"filesystem"[[:space:]]*:[[:space:]]*"ext4"' 'ext4 root filesystem is missing'
+require_value '"swap"[[:space:]]*:[[:space:]]*"none"' 'swap policy is not none'
+if [[ "$SCHEMA_VERSION" == 1.0 ]]; then
+    require_value '"id"[[:space:]]*:[[:space:]]*"hyprland-caelestia"' 'legacy desktop profile is missing'
+fi
+require_value '"enabled"[[:space:]]*:[[:space:]]*false' 'encryption is not disabled'
+require_value '"secrets_included"[[:space:]]*:[[:space:]]*false' 'secrets_included is not false'
+require_value '"number"[[:space:]]*:[[:space:]]*1' 'EFI partition entry is missing'
+require_value '"number"[[:space:]]*:[[:space:]]*2' 'root partition entry is missing'
+
+if [[ "$SCHEMA_VERSION" == 1.1 ]]; then
+    for field in install_profile locale keyboard_layout timezone hostname network_policy account_policy session_policy requested_packages resolved_package_availability; do
+        require_field "$field"
+    done
+    require_value '"package_source"[[:space:]]*:[[:space:]]*"official_arch_repositories"' 'package source is not official Arch repositories'
+    require_value '"mode"[[:space:]]*:[[:space:]]*"planner_only"' '1.1 plan is not planner-only'
+    require_value '"secrets_included"[[:space:]]*:[[:space:]]*false' '1.1 plan is not secret-free'
+    require_value '"status"[[:space:]]*:[[:space:]]*"(verified|not_run)"' 'package availability status is invalid'
+    if grep -Eq '"id"[[:space:]]*:[[:space:]]*"hyprland-caelestia"' "$PLAN_PATH"; then
+        require_value '"commit"[[:space:]]*:[[:space:]]*"[0-9a-f]{40}"' 'Caelestia source commit is not immutable'
+    fi
+fi
+
+if grep -Eiq '"(password|private_key|private_key_material|token|credential|secret)"[[:space:]]*:' "$PLAN_PATH" 2>/dev/null; then
+    error 'plan contains a prohibited credential or secret field'
+fi
+if grep -Eiq '"(executor_enabled|mutates_target_disk)"[[:space:]]*:[[:space:]]*true' "$PLAN_PATH" 2>/dev/null; then
+    error 'plan enables execution or target-disk mutation'
+fi
+
+# Optional strict syntax checks. The fallback policy checks intentionally do
+# not require jq, Python, Perl, or any other JSON parser in the live ISO.
+if command -v jq >/dev/null 2>&1; then
+    jq -e . "$PLAN_PATH" >/dev/null 2>&1 || error 'plan is not valid JSON (jq)'
+elif command -v perl >/dev/null 2>&1; then
+    perl -MJSON::PP -e 'decode_json(do { local $/; <> })' "$PLAN_PATH" >/dev/null 2>&1 || error 'plan is not valid JSON (Perl JSON::PP)'
+fi
+
+if ((ERRORS)); then
+    printf '%bPlan validation failed with %d error(s).%b\n' "$RED" "$ERRORS" "$RESET" >&2
+    exit 1
+fi
+
+printf '%bPlan validation passed:%b %s\n' "$GREEN" "$RESET" "$PLAN_PATH"

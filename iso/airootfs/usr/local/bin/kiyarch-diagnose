@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_MOUNT=/mnt
+ESP_MOUNT=/mnt/boot/efi
+FAILED=0
+
+usage() {
+    printf 'Usage: kiyarch-diagnose [--root PATH] [--esp PATH]\n'
+    printf 'Read-only report for an installed KiyArch root and EFI system partition.\n'
+}
+
+while (($#)); do
+    case "$1" in
+        --root) (($# >= 2)) || { usage >&2; exit 2; }; ROOT_MOUNT=$2; shift 2 ;;
+        --esp) (($# >= 2)) || { usage >&2; exit 2; }; ESP_MOUNT=$2; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+
+ok() { printf '%-31s OK\n' "$1"; }
+bad() { printf '%-31s MISSING/INVALID: %s\n' "$1" "$2"; FAILED=1; }
+
+printf 'KiyArch installed-system diagnostic (read-only)\n\n'
+
+if [[ -d "$ROOT_MOUNT/etc" && -d "$ROOT_MOUNT/usr" ]]; then ok 'Root filesystem'; else bad 'Root filesystem' "$ROOT_MOUNT is not an installed root"; fi
+if [[ -d "$ESP_MOUNT" && "$(findmnt -no FSTYPE --target "$ESP_MOUNT" 2>/dev/null || true)" == vfat ]]; then ok 'ESP filesystem/mount'; else bad 'ESP filesystem/mount' "$ESP_MOUNT is not a mounted vfat filesystem"; fi
+if [[ -s "$ESP_MOUNT/EFI/systemd/systemd-bootx64.efi" ]]; then ok 'systemd-boot binary'; else bad 'systemd-boot binary' "$ESP_MOUNT/EFI/systemd/systemd-bootx64.efi"; fi
+if [[ -s "$ESP_MOUNT/EFI/BOOT/BOOTX64.EFI" ]]; then ok 'UEFI fallback binary'; else bad 'UEFI fallback binary' "$ESP_MOUNT/EFI/BOOT/BOOTX64.EFI"; fi
+if [[ -s "$ESP_MOUNT/loader/loader.conf" ]]; then ok 'loader.conf'; else bad 'loader.conf' "$ESP_MOUNT/loader/loader.conf"; fi
+if [[ -s "$ESP_MOUNT/loader/entries/kiyarch.conf" ]]; then ok 'KiyArch loader entry'; else bad 'KiyArch loader entry' "$ESP_MOUNT/loader/entries/kiyarch.conf"; fi
+if [[ -s "$ESP_MOUNT/vmlinuz-linux" ]]; then ok 'ESP kernel'; else bad 'ESP kernel' "$ESP_MOUNT/vmlinuz-linux"; fi
+if [[ -s "$ESP_MOUNT/initramfs-linux.img" ]]; then ok 'ESP initramfs'; else bad 'ESP initramfs' "$ESP_MOUNT/initramfs-linux.img"; fi
+
+root_uuid=''
+if [[ -s "$ROOT_MOUNT/etc/fstab" ]]; then
+    if findmnt --verify --tab-file "$ROOT_MOUNT/etc/fstab" >/dev/null 2>&1; then ok 'fstab'; else bad 'fstab' 'findmnt verification failed'; fi
+    root_source=$(awk '$2 == "/" && $1 !~ /^#/ { print $1; exit }' "$ROOT_MOUNT/etc/fstab")
+    if [[ "$root_source" == UUID=* ]]; then
+        root_uuid=${root_source#UUID=}
+        if blkid -U "$root_uuid" >/dev/null 2>&1; then ok 'root UUID resolves'; else bad 'root UUID resolves' "$root_uuid"; fi
+    else
+        bad 'root fstab source' 'expected UUID=...'
+    fi
+else
+    bad 'fstab' "$ROOT_MOUNT/etc/fstab"
+fi
+
+ESP_BOOT_PATH="$ESP_MOUNT"
+if [[ "$ESP_MOUNT" == "$ROOT_MOUNT"/* ]]; then ESP_BOOT_PATH="/${ESP_MOUNT#"$ROOT_MOUNT"/}"; fi
+if command -v bootctl >/dev/null 2>&1 && bootctl --no-pager --root="$ROOT_MOUNT" --esp-path="$ESP_BOOT_PATH" status >/dev/null 2>&1; then ok 'bootctl status'; else bad 'bootctl status' 'installed-root-aware bootctl check failed'; fi
+printf '\n'
+exit "$FAILED"

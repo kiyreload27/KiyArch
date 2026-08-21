@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+# Local tty1 only: SSH sessions and manually opened shells remain unaffected.
+set -u
+[[ "$(tty 2>/dev/null || true)" == /dev/tty1 ]] || exit 0
+[[ -z "${SSH_CONNECTION:-}" && -z "${SSH_TTY:-}" ]] || exit 0
+
+run_installer() {
+    local answer plan=/run/kiyarch/install-plan.json
+    kiyarch-install --export-plan "$plan" || return
+    printf '\nA validated plan is ready at %s.\n' "$plan"
+    read -r -p 'Type EXECUTE KIYARCH INSTALLATION to continue to the destructive executor, or anything else to return: ' answer || return
+    [[ "$answer" == 'EXECUTE KIYARCH INSTALLATION' ]] || {
+        printf 'Execution cancelled. The plan remains available at %s.\n' "$plan"
+        return
+    }
+    kiyarch-execute --plan "$plan"
+}
+
+while :; do
+    clear 2>/dev/null || true
+    printf '\033[36m\033[1mKiyArch Live Environment\033[0m\n\n'
+    printf '  1) Start KiyArch installer\n  2) Hardware report\n  3) Network status\n  4) SSH status\n  5) Installation guide\n  6) Open rescue shell\n  7) Reboot\n  8) Power off\n\n'
+    read -r -p 'Choose an option (q opens a shell): ' choice || exit 0
+    case "$choice" in
+        1) run_installer;; 2) kiyarch-hw;; 3) kiyarch-network;; 4) kiyarch-ssh;;
+        5) Installation_guide;; 6|q|Q) exec bash --noprofile --norc -i;;
+        7) systemctl reboot;; 8) systemctl poweroff;;
+        *) printf 'Choose a number from 1 to 8.\n'; sleep 1;;
+    esac
+    printf '\nPress Enter to return to the KiyArch menu...'; read -r _ || exit 0
+done

@@ -22,6 +22,9 @@ installer work without creating a separate incompatible distribution.
 The current development ISO provides:
 
 - the `kiyarch-help` command and KiyArch MOTD;
+- the read-only `kiyarch-install` planner, which creates a validated JSON
+  installation plan without executing any disk or package operation;
+- the dependency-free `kiyarch-plan --validate` plan contract checker;
 - read-only `kiyarch-hw` detection for system firmware/virtualization,
   manufacturer and form factor, Intel/AMD CPU microcode, Intel/AMD/NVIDIA and
   virtual graphics, networking, Bluetooth, laptop power devices, and physical
@@ -32,6 +35,8 @@ The current development ISO provides:
 - OpenSSH with `sshd.service` enabled at boot;
 - `kiyarch-ssh` for service, port, LAN address, hostname, authentication, and
   authorized-key status.
+- `kiyarch-diagnose` for a read-only report of an installed root, ESP,
+  systemd-boot files, loader entry, fstab, UUID resolution, and bootctl state.
 
 SSH uses public-key authentication by default. Root password authentication is
 disabled, no password is created automatically, and the helper never prints
@@ -42,6 +47,72 @@ load unexpected modules, modify configuration, partition disks, or format
 storage. NVIDIA driver selection is deferred until installation can inspect the
 exact GPU and target setup. Removable disks are shown explicitly and require
 future installer confirmation.
+
+## Terminal installer and profiles
+
+Run the planner from the live environment with:
+
+```bash
+kiyarch-install --export-plan /run/kiyarch/install-plan.json
+```
+
+The tty1 session opens a local-only KiyArch menu; SSH and manually opened
+shells are unaffected. The planner always presents Minimal, Laptop, Desktop,
+Hyprland + Caelestia, and Custom profiles. Profile manifests are versioned
+JSON data under `iso/airootfs/usr/local/share/kiyarch/profiles`.
+
+The planner emits schema `1.1`, resolves packages from official Arch
+repositories, verifies the pinned Caelestia source, and never changes a disk.
+The separate executor is invoked explicitly with
+`kiyarch-execute --plan /run/kiyarch/install-plan.json` (or `--dry-run`). It
+supports only UEFI/GPT, one 1 GiB FAT32 EFI partition, remaining ext4 root,
+no swap, no encryption, NetworkManager, a named sudo user, and a locked root
+password. It recollects disk identity, requires two exact confirmations, and
+runs post-install validation.
+
+Support status is intentionally conservative: Minimal UEFI/systemd-boot is
+the current end-to-end milestone and remains `Static-tests-only` until a fresh
+disposable VM has booted from its installed disk twice. Laptop, Desktop,
+Hyprland + Caelestia, and Custom are `Static-tests-only`; GRUB is `Deferred`
+and legacy BIOS installation is `Deferred`.
+
+It lists device, size, model, transport, removable state, read-only state,
+current partition-table metadata, and warnings before selection. Legacy BIOS,
+missing disks, read-only disks, unsafe metadata, unsupported current partition
+tables, and disks too small for the preview are rejected. The selected disk is
+re-scanned immediately before the plan is written. Export requires the exact
+confirmation `CREATE PLANNER-ONLY PLAN`; removable media additionally require
+`I UNDERSTAND THIS IS REMOVABLE MEDIA`.
+
+The output is versioned JSON with `schema_version: "1.1"` and these stable
+sections: `source_hardware`, `target_disk`, `firmware_policy`,
+`partition_layout`, `filesystem_policy`, `account_configuration`,
+`desktop_profile`, `encryption`, `execution`, `warnings`, and
+`unresolved_decisions`. The validator still reads 1.0 planner-only plans, but
+the executor accepts only 1.1. Passwords, private keys, and other secrets are
+never written to plans or logs.
+
+Run the safe regression suite from the development checkout with:
+
+```bash
+scripts/test-installer.sh
+```
+
+For a disposable UEFI VM, native Windows users can use
+`scripts/qemu-minimal-test.ps1` after installing QEMU. The first run boots the
+ISO with a fresh qcow2 disk; stop QEMU after installation, then run it again
+with `-Installed` to boot the disk without the ISO. The Bash equivalent is
+available for Linux/WSL users as `scripts/qemu-minimal-test.sh`.
+
+Validate an exported plan inside the live environment with:
+
+```bash
+kiyarch-plan --validate /run/kiyarch/install-plan.json
+```
+
+The validator uses only standard live-environment tools for policy checks. It
+does not require a JSON package, and optionally performs a stricter syntax
+check when `jq` or Perl JSON support is available.
 
 ## Build and validation
 
@@ -72,8 +143,8 @@ KiyArch 0.0.x focuses on:
 - safe disk selection
 - reproducible ISO builds
 
-The installer itself will be developed only after the live ISO foundation is
-verified. KiyArch is still in development: the installer, disk safety flow,
-Hyprland/Caelestia setup, and broader physical-hardware testing are not yet
-implemented. A successful builder-VM test is not a claim of compatibility with
-every physical desktop, laptop, GPU, or firmware combination.
+The fixed-layout executor is implemented with explicit final validation, but a
+successful installation or boot is not claimed until the disposable-VM
+regression passes. This is not a claim of compatibility with every physical
+desktop, laptop, GPU, or firmware combination. Encryption, swap, Btrfs, LVM, RAID, multi-disk, BIOS
+installation, AUR, arbitrary repositories, and custom layouts remain deferred.

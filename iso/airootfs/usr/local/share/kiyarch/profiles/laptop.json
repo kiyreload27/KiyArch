@@ -1,0 +1,14 @@
+{
+  "id": "laptop",
+  "display_name": "Laptop",
+  "description": "Minimal plus wireless, Bluetooth, audio, battery, suspend, and brightness support.",
+  "manifest_version": "1",
+  "manifest_hash": "sha256:fb6315f77daa1dc6ffd7b3fa5bf60cf6732f782ebb779dd5107e6ac38b4e6c45",
+  "required_components": ["base-system", "networkmanager", "bluetooth", "power", "audio"],
+  "optional_components": ["ssh", "graphical-session"],
+  "packages": ["base", "linux", "linux-firmware", "sudo", "networkmanager", "man-db", "man-pages", "less", "vim", "zsh", "bluez", "bluez-utils", "power-profiles-daemon", "brightnessctl", "libinput", "pipewire", "pipewire-pulse", "wireplumber", "sof-firmware"],
+  "services": ["NetworkManager.service", "bluetooth.service", "power-profiles-daemon.service"],
+  "configuration_templates": ["locale", "keyboard", "timezone", "hostname", "sudoers", "audio"],
+  "graphical_session": false,
+  "caelestia_source": null
+}

@@ -4,6 +4,15 @@
 # future installer must confirm all hardware and disk choices.
 set -u
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for HARDWARE_LIB in /usr/local/lib/kiyarch-hardware.sh "$SCRIPT_DIR/../lib/kiyarch-hardware.sh"; do
+    [[ -r "$HARDWARE_LIB" ]] && source "$HARDWARE_LIB" && break
+done
+if ! declare -F kiyarch_collect_storage >/dev/null; then
+    printf 'kiyarch-hw: shared hardware library is unavailable\n' >&2
+    exit 1
+fi
+
 BOLD="\033[1m"; CYAN="\033[36m"; DIM="\033[2m"; GREEN="\033[32m"; RESET="\033[0m"
 JSON_MODE=0
 case "${1:-}" in
@@ -13,57 +22,12 @@ case "${1:-}" in
     *) printf 'Usage: kiyarch-hw [--json]\n' >&2; exit 2 ;;
 esac
 
-have() { command -v "$1" >/dev/null 2>&1; }
-
-read_value() {
-    local path="$1" value=""
-    if [[ -r "$path" ]]; then IFS= read -r value < "$path" || true; fi
-    printf '%s' "$value"
-}
-
-first_nonempty() {
-    local value
-    for value in "$@"; do
-        if [[ -n "$value" && "$value" != None && "$value" != unknown ]]; then
-            printf '%s' "$value"; return
-        fi
-    done
-}
-
-json_escape() {
-    local input="$1" output="" character ordinal index
-    for ((index=0; index<${#input}; index++)); do
-        character="${input:index:1}"
-        case "$character" in
-            '\\') output+='\\\\' ;;
-            '"') output+='\\"' ;;
-            $'\n') output+='\\n' ;;
-            $'\r') output+='\\r' ;;
-            $'\t') output+='\\t' ;;
-            *)
-                printf -v ordinal '%d' "'${character}"
-                if ((ordinal < 32)); then printf -v character '\\u%04x' "$ordinal"; fi
-                output+="$character"
-                ;;
-        esac
-    done
-    printf '%s' "$output"
-}
-
-json_string() { printf '"%s"' "$(json_escape "$1")"; }
-
-json_array_strings() {
-    local first=1 value
-    printf '['
-    for value in "$@"; do
-        ((first)) || printf ','; first=0; json_string "$value"
-    done
-    printf ']'
-}
-
-json_bool() {
-    [[ "$1" == yes || "$1" == true || "$1" == 1 ]] && printf true || printf false
-}
+have() { kiyarch_have "$@"; }
+read_value() { kiyarch_read_value "$@"; }
+first_nonempty() { kiyarch_first_nonempty "$@"; }
+json_string() { kiyarch_json_string "$@"; }
+json_array_strings() { kiyarch_json_array_strings "$@"; }
+json_bool() { kiyarch_json_bool "$@"; }
 
 section() {
     local title="$1"
@@ -74,8 +38,9 @@ section() {
 item() { printf '  %-22s %s\n' "$1" "$2"; }
 
 # System -------------------------------------------------------------------
-ARCH="$(uname -m 2>/dev/null || printf unknown)"
-[[ -d /sys/firmware/efi ]] && FIRMWARE=uefi || FIRMWARE=legacy_bios
+kiyarch_collect_platform
+ARCH="$KIYARCH_ARCH"
+FIRMWARE="$KIYARCH_FIRMWARE"
 VIRT=none; VM_TECHNOLOGY=none
 if have systemd-detect-virt; then
     VIRT="$(systemd-detect-virt 2>/dev/null || printf none)"
@@ -210,35 +175,11 @@ done
 # Physical disks only. Loop, optical, zram, and other non-disk devices are
 # excluded; removable disks remain visible and are explicitly labelled.
 declare -a STORAGE_JSON_ITEMS=() STORAGE_HUMAN_LINES=()
-if have lsblk; then
-    lsblk_field() {
-        local field="$1" record="$2" expression
-        expression="${field}=\"([^\"]*)\""
-        [[ "$record" =~ $expression ]] && printf '%s' "${BASH_REMATCH[1]}"
-    }
-    while IFS= read -r record; do
-        [[ -n "$record" ]] || continue
-        device="$(lsblk_field PATH "$record")"; type="$(lsblk_field TYPE "$record")"; transport="$(lsblk_field TRAN "$record")"
-        size="$(lsblk_field SIZE "$record")"; model="$(lsblk_field MODEL "$record")"; rota="$(lsblk_field ROTA "$record")"; removable="$(lsblk_field RM "$record")"; read_only="$(lsblk_field RO "$record")"
-        name="$(basename "$device")"
-        [[ "$type" == disk && "$name" != zram* && -e "/sys/class/block/$name/device" && -n "$device" ]] || continue
-        transport="${transport:-unknown}"; model="${model:-unknown}"; media=unknown
-        [[ "$rota" == 1 ]] && media=rotational; [[ "$rota" == 0 ]] && media=solid_state
-        rotational_json=false; [[ "$rota" == 1 ]] && rotational_json=true
-        readonly_json=false; [[ "$read_only" == 1 ]] && readonly_json=true
-        removable_flag=no; [[ "$removable" == 1 || "$transport" == usb ]] && removable_flag=yes
-        storage_class=other
-        case "$transport" in
-            nvme) storage_class=nvme ;;
-            sata|ata) storage_class=sata ;;
-            usb) storage_class=usb ;;
-        esac
-        STORAGE_JSON_ITEMS+=("$(printf '{\"device\":%s,\"size\":%s,\"model\":%s,\"transport\":%s,\"storage_class\":%s,\"media\":%s,\"rotational\":%s,\"removable\":%s,\"readonly\":%s,\"install_target_candidate\":true}' \
-            "$(json_string "$device")" "$(json_string "$size")" "$(json_string "$model")" "$(json_string "$transport")" "$(json_string "$storage_class")" "$(json_string "$media")" \
-            "$(json_bool "$rotational_json")" "$(json_bool "$removable_flag")" "$(json_bool "$readonly_json")")")
-        STORAGE_HUMAN_LINES+=("$device  $size  $model  [$storage_class, $media, removable: $removable_flag]")
-    done < <(lsblk -dnP -o PATH,TYPE,TRAN,SIZE,MODEL,ROTA,RM,RO 2>/dev/null)
-fi
+kiyarch_collect_storage
+for ((index=0; index<${#STORAGE_DEVICE[@]}; index++)); do
+    STORAGE_JSON_ITEMS+=("$(kiyarch_storage_json_item "$index")")
+    STORAGE_HUMAN_LINES+=("${STORAGE_DEVICE[$index]}  ${STORAGE_SIZE[$index]}  ${STORAGE_MODEL[$index]}  [${STORAGE_CLASS[$index]}, ${STORAGE_MEDIA[$index]}, transport: ${STORAGE_TRANSPORT[$index]}, removable: ${STORAGE_REMOVABLE[$index]}, read-only: ${STORAGE_READONLY[$index]}, metadata: ${STORAGE_METADATA[$index]}]")
+done
 
 declare -a WARNINGS=(
     "Hardware classification is read-only and may be heuristic; installation must confirm every target and driver choice."
@@ -246,6 +187,7 @@ declare -a WARNINGS=(
 )
 ((GPU_NVIDIA)) && WARNINGS+=("NVIDIA driver selection is intentionally deferred until installation can inspect the exact GPU and target setup.")
 ((${#STORAGE_JSON_ITEMS[@]} == 0)) && WARNINGS+=("No physical install-target disk was detected by the available interfaces.")
+for value in "${STORAGE_WARNINGS[@]}"; do WARNINGS+=("$value"); done
 
 print_json() {
     local first item

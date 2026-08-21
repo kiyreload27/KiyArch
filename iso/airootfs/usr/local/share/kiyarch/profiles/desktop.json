@@ -1,0 +1,14 @@
+{
+  "id": "desktop",
+  "display_name": "Desktop",
+  "description": "Desktop foundations for a Wayland/XWayland graphical session; Caelestia is not included.",
+  "manifest_version": "1",
+  "manifest_hash": "sha256:bcd158b66058ffad9880b1569fdc0789d0943e71959ceb71856a99a8a9294e63",
+  "required_components": ["base-system", "networkmanager", "audio", "graphics", "portals", "polkit", "fonts"],
+  "optional_components": ["ssh", "greetd"],
+  "packages": ["base", "linux", "linux-firmware", "sudo", "networkmanager", "man-db", "man-pages", "less", "vim", "zsh", "pipewire", "pipewire-pulse", "wireplumber", "mesa", "wayland", "xorg-xwayland", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "polkit", "fontconfig", "ttf-dejavu", "greetd", "tuigreet", "foot", "qt5-wayland", "qt6-wayland", "gtk3", "gtk4"],
+  "services": ["NetworkManager.service", "greetd.service"],
+  "configuration_templates": ["locale", "keyboard", "timezone", "hostname", "sudoers", "audio", "greetd"],
+  "graphical_session": true,
+  "caelestia_source": null
+}
