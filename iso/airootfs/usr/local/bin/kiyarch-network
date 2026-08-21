@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -u
+printf '\nKiyArch network status\n\n'
+if command -v nmcli >/dev/null 2>&1; then
+    nmcli general status 2>/dev/null || true
+    printf '\nDevices:\n'; nmcli device status 2>/dev/null || true
+else
+    printf 'NetworkManager is not available in this live image.\n'
+    command -v ip >/dev/null 2>&1 && ip -brief address || true
+fi
+printf '\nDNS:\n'
+if command -v resolvectl >/dev/null 2>&1; then resolvectl status 2>/dev/null | sed -n '1,24p'; else cat /etc/resolv.conf 2>/dev/null || true; fi

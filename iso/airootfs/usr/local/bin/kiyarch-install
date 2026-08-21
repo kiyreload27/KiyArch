@@ -1,0 +1,449 @@
+#!/usr/bin/env bash
+
+# KiyArch milestone 1: read-only installation-plan generator.
+# This command intentionally has no installation executor.
+set -u
+
+BOLD="\033[1m"; CYAN="\033[36m"; YELLOW="\033[33m"; GREEN="\033[32m"; RED="\033[31m"; RESET="\033[0m"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for HARDWARE_LIB in /usr/local/lib/kiyarch-hardware.sh "$SCRIPT_DIR/../lib/kiyarch-hardware.sh"; do
+    [[ -r "$HARDWARE_LIB" ]] && source "$HARDWARE_LIB" && break
+done
+for PROFILE_LIB in /usr/local/lib/kiyarch-profiles.sh "$SCRIPT_DIR/../lib/kiyarch-profiles.sh"; do
+    [[ -r "$PROFILE_LIB" ]] && source "$PROFILE_LIB" && break
+done
+if ! declare -F kiyarch_collect_storage >/dev/null; then
+    printf 'kiyarch-install: shared hardware library is unavailable\n' >&2
+    exit 1
+fi
+if ! declare -F kiyarch_profiles_init >/dev/null || ! kiyarch_profiles_init; then
+    printf 'kiyarch-install: profile manifests are unavailable\n' >&2
+    exit 1
+fi
+PLAN_VALIDATOR=/usr/local/bin/kiyarch-plan
+[[ -x "$PLAN_VALIDATOR" ]] || PLAN_VALIDATOR="$SCRIPT_DIR/kiyarch-plan"
+
+EFI_SIZE_BYTES=1073741824
+DEFAULT_EXPORT_PATH=/run/kiyarch/install-plan.json
+EXPORT_PATH=""
+ADMIN_USER=""
+SELECTED_INDEX=-1
+# Library-only callers (including offline regression tests) may call
+# print_plan_json directly; interactive execution always replaces this with
+# an explicit menu selection.
+PROFILE_ID="hyprland-caelestia"
+CUSTOM_BASE="minimal"
+LOCALE="en_US.UTF-8"
+KEYBOARD="us"
+TIMEZONE="UTC"
+HOSTNAME_VALUE="kiyarch"
+USER_SHELL="zsh"
+SSH_REQUESTED=false
+GRAPHICAL_REQUESTED=false
+LAPTOP_FEATURES=false
+DESKTOP_FEATURES=false
+ADDITIONAL_PACKAGES=()
+REQUESTED_PACKAGES=()
+RESOLVED_PACKAGE_STATUS="not_run"
+MICROCODE_PACKAGE="none"
+
+usage() {
+    cat <<'USAGE'
+Usage: kiyarch-install [--export-plan PATH] [--help]
+
+Launch the terminal KiyArch installation planner. The planner requires
+explicit profile, disk, and account selection, verifies official packages,
+and exports a planner_only JSON plan only after typed confirmation.
+USAGE
+}
+
+fail() { printf '%bERROR:%b %s\n' "$RED" "$RESET" "$1" >&2; exit 1; }
+
+while (($#)); do
+    case "$1" in
+        --export-plan)
+            (($# >= 2)) || fail '--export-plan requires a path'
+            EXPORT_PATH="$2"
+            shift 2
+            ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+[[ -n "$EXPORT_PATH" ]] || EXPORT_PATH="$DEFAULT_EXPORT_PATH"
+[[ "$EXPORT_PATH" == /* ]] || fail 'export path must be absolute'
+
+section() {
+    local title="$1"
+    printf '\n%b%s%b\n' "$BOLD$CYAN" "$title" "$RESET"
+    printf '%*s\n' "${#title}" '' | tr ' ' '-'
+}
+
+item() { printf '  %-22s %s\n' "$1" "$2"; }
+
+ask_default() {
+    local prompt="$1" default="$2" answer
+    read -r -p "$prompt [$default]: " answer || fail 'input ended unexpectedly'
+    printf '%s' "${answer:-$default}"
+}
+
+validate_hostname() { [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]]; }
+validate_timezone() { [[ "$1" =~ ^[A-Za-z0-9_+./-]+$ && "$1" != /* && "$1" != *..* ]]; }
+
+select_profile() {
+    local index choice id
+    section 'Select an installation profile'
+    printf 'A profile is never selected automatically.\n\n'
+    for ((index=0; index<${#KIYARCH_PROFILE_IDS[@]}; index++)); do
+        id="${KIYARCH_PROFILE_IDS[$index]}"
+        printf '  %d) %-24s %s\n' "$((index + 1))" \
+            "$(kiyarch_profile_field "$id" display_name)" \
+            "$(kiyarch_profile_field "$id" description)"
+    done
+    while :; do
+        read -r -p 'Select profile number: ' choice || fail 'no profile was selected'
+        [[ "$choice" =~ ^[1-5]$ ]] || { printf 'Enter one of the displayed profile numbers.\n'; continue; }
+        PROFILE_ID="${KIYARCH_PROFILE_IDS[$((choice - 1))]}"
+        break
+    done
+    printf 'Selected: %s\n' "$(kiyarch_profile_field "$PROFILE_ID" display_name)"
+}
+
+prompt_custom() {
+    local choice line package
+    [[ "$PROFILE_ID" == custom ]] || return 0
+    section 'Custom profile components'
+    printf 'Choose a base profile: 1) Minimal  2) Laptop  3) Desktop  4) Hyprland + Caelestia\n'
+    while :; do
+        read -r -p 'Base profile [1]: ' choice || fail 'custom base profile was not selected'
+        choice="${choice:-1}"
+        case "$choice" in
+            1) CUSTOM_BASE=minimal;; 2) CUSTOM_BASE=laptop;; 3) CUSTOM_BASE=desktop;;
+            4) CUSTOM_BASE=hyprland-caelestia;; *) printf 'Choose 1, 2, 3, or 4.\n'; continue;;
+        esac
+        break
+    done
+    SSH_REQUESTED=false
+    if [[ "$(ask_default 'Enable SSH in the installed system? (y/n)' n)" =~ ^[Yy]$ ]]; then SSH_REQUESTED=true; fi
+    GRAPHICAL_REQUESTED=false
+    if [[ "$(ask_default 'Install the graphical session from the base profile? (y/n)' n)" =~ ^[Yy]$ ]]; then GRAPHICAL_REQUESTED=true; fi
+    LAPTOP_FEATURES=false
+    if [[ "$(ask_default 'Add laptop power/Bluetooth/input features? (y/n)' n)" =~ ^[Yy]$ ]]; then LAPTOP_FEATURES=true; fi
+    DESKTOP_FEATURES=false
+    if [[ "$(ask_default 'Add desktop graphics/audio/portal features? (y/n)' n)" =~ ^[Yy]$ ]]; then DESKTOP_FEATURES=true; fi
+    read -r -p 'Additional official package names (space-separated, blank for none): ' line || fail 'package input ended unexpectedly'
+    read -r -a ADDITIONAL_PACKAGES <<< "$line"
+    for package in "${ADDITIONAL_PACKAGES[@]}"; do
+        kiyarch_package_name_valid "$package" || fail "invalid package name '$package'; URLs, commands, repositories, and AUR packages are not accepted"
+    done
+}
+
+prompt_settings() {
+    local value
+    section 'Installed-system defaults'
+    LOCALE="$(ask_default 'Locale' "$LOCALE")"
+    [[ "$LOCALE" =~ ^[A-Za-z0-9_.@+-]+$ ]] || fail 'locale is invalid'
+    KEYBOARD="$(ask_default 'Keyboard layout' "$KEYBOARD")"
+    [[ "$KEYBOARD" =~ ^[a-zA-Z0-9_-]+$ ]] || fail 'keyboard layout is invalid'
+    TIMEZONE="$(ask_default 'Timezone' "$TIMEZONE")"; validate_timezone "$TIMEZONE" || fail 'timezone is invalid'
+    HOSTNAME_VALUE="$(ask_default 'Hostname' "$HOSTNAME_VALUE")"; validate_hostname "$HOSTNAME_VALUE" || fail 'hostname is invalid'
+    USER_SHELL="$(ask_default 'User shell' "$USER_SHELL")"
+    case "$USER_SHELL" in bash|zsh|fish) ;; *) fail 'user shell must be bash, zsh, or fish' ;; esac
+    while :; do
+        read -r -p 'Administrative username [kiy]: ' value || fail 'no administrative username was provided'
+        value="${value:-kiy}"
+        if validate_username "$value"; then ADMIN_USER="$value"; break; fi
+        printf 'Use 1-32 lowercase letters, numbers, underscores, or hyphens; do not use root.\n'
+    done
+    if [[ "$PROFILE_ID" != custom ]]; then
+        SSH_REQUESTED=false
+        if [[ "$(ask_default 'Enable optional SSH in the installed system? (y/n)' n)" =~ ^[Yy]$ ]]; then SSH_REQUESTED=true; fi
+    fi
+}
+
+build_package_list() {
+    local base="$PROFILE_ID" package
+    [[ "$base" == custom ]] && base="$CUSTOM_BASE"
+    mapfile -t REQUESTED_PACKAGES < <(kiyarch_profile_packages "$base")
+    [[ "$SSH_REQUESTED" == true ]] && REQUESTED_PACKAGES+=(openssh)
+    [[ "$LAPTOP_FEATURES" == true ]] && REQUESTED_PACKAGES+=(bluez bluez-utils power-profiles-daemon brightnessctl libinput)
+    [[ "$DESKTOP_FEATURES" == true ]] && REQUESTED_PACKAGES+=(mesa wayland xorg-xwayland xdg-desktop-portal xdg-desktop-portal-gtk polkit)
+    [[ "$PROFILE_ID" == custom && "$GRAPHICAL_REQUESTED" == true ]] && REQUESTED_PACKAGES+=(greetd tuigreet hyprland wayland xorg-xwayland xdg-desktop-portal xdg-desktop-portal-gtk polkit)
+    if [[ "$PROFILE_ID" == custom && "$GRAPHICAL_REQUESTED" == false ]]; then
+        REQUESTED_PACKAGES=($(printf '%s\n' "${REQUESTED_PACKAGES[@]}" | grep -Ev '^(greetd|tuigreet|hyprland|hyprpaper|grim|slurp|mako|quickshell|qt5-wayland|qt6-wayland|gtk3|gtk4|git|cmake|ninja|qt6-base|qt6-declarative|qt6-imageformats|qt6-shadertools|ddcutil|libcava|lm_sensors|aubio|libqalculate|swappy|fish|ttf-material-symbols-variable|ttf-rubik-vf|ttf-cascadia-code-nerd)$' || true))
+    fi
+    [[ "$MICROCODE_PACKAGE" != none ]] && REQUESTED_PACKAGES+=("$MICROCODE_PACKAGE")
+    REQUESTED_PACKAGES+=("${ADDITIONAL_PACKAGES[@]}")
+    mapfile -t REQUESTED_PACKAGES < <(printf '%s\n' "${REQUESTED_PACKAGES[@]}" | kiyarch_unique_packages)
+    kiyarch_validate_package_list "${REQUESTED_PACKAGES[@]}" || fail 'requested package list contains an invalid package name'
+    for package in "${REQUESTED_PACKAGES[@]}"; do [[ -n "$package" ]] || fail 'requested package list contains an empty package'; done
+}
+
+package_preflight() {
+    local package repo commit
+    section 'Online package and source preflight'
+    command -v pacman >/dev/null 2>&1 || fail 'pacman is unavailable; official repository packages cannot be verified'
+    [[ -s /etc/pacman.conf ]] || fail 'pacman configuration is missing'
+    [[ -s /etc/pacman.d/mirrorlist ]] || fail 'mirror configuration is missing'
+    if command -v getent >/dev/null 2>&1 && ! getent hosts archlinux.org >/dev/null 2>&1; then fail 'DNS/network preflight failed for archlinux.org'; fi
+    pacman -Sy --noconfirm >/dev/null 2>&1 || fail 'official repository metadata could not be refreshed'
+    for package in "${REQUESTED_PACKAGES[@]}"; do
+        printf '  checking %s...\n' "$package"
+        pacman -Sp --noconfirm --needed --print-format '%n' "$package" >/dev/null 2>&1 || fail "official repository package is unavailable: $package"
+    done
+    local source_profile="$PROFILE_ID"
+    [[ "$PROFILE_ID" == custom && "$GRAPHICAL_REQUESTED" == false ]] && source_profile=""
+    [[ "$source_profile" == custom ]] && source_profile="$CUSTOM_BASE"
+    repo=""; commit=""
+    [[ -n "$source_profile" ]] && repo="$(kiyarch_profile_source_repository "$source_profile" || true)"
+    [[ -n "$source_profile" ]] && commit="$(kiyarch_profile_source_commit "$source_profile" || true)"
+    if [[ -n "$repo" || -n "$commit" ]]; then
+        [[ -n "$repo" && "$commit" =~ ^[0-9a-f]{40}$ ]] || fail 'Caelestia source is not pinned to a full immutable commit'
+        command -v git >/dev/null 2>&1 || fail 'git is unavailable for the pinned Caelestia source'
+        git ls-remote "$repo" "$commit^{commit}" | awk -v commit="$commit" '$1 == commit { found=1 } END { exit !found }' || fail "pinned Caelestia commit cannot be fetched: $commit"
+    fi
+    RESOLVED_PACKAGE_STATUS=verified
+    printf 'Package and source preflight passed.\n'
+}
+
+print_preflight() {
+    section 'KiyArch installation planner'
+    printf 'Read-only milestone: no target disk changes are performed.\n'
+    item 'Plan schema:' '1.1'
+    item 'Execution mode:' 'planner_only (executor disabled)'
+    item 'Firmware:' "$KIYARCH_FIRMWARE"
+    item 'Target policy:' 'one explicit disk, GPT, UEFI, ext4 root'
+    item 'Encryption:' 'disabled in fixed executor layout'
+    if [[ "$KIYARCH_FIRMWARE" != uefi ]]; then
+        printf '%b\nThis milestone supports UEFI firmware only; legacy BIOS was detected.%b\n' "$RED" "$RESET"
+        exit 1
+    fi
+}
+
+print_disks() {
+    local index marker
+    section 'Select the installation target disk'
+    printf 'Every disk is shown before selection. Enter a number; there is no automatic target.\n\n'
+    if ((${#STORAGE_DEVICE[@]} == 0)); then
+        printf '%bNo physical disks were detected. Nothing can be selected.%b\n' "$RED" "$RESET"
+        exit 1
+    fi
+    for ((index=0; index<${#STORAGE_DEVICE[@]}; index++)); do
+        marker=''
+        [[ "${STORAGE_METADATA[$index]}" != complete ]] && marker=' [UNAVAILABLE METADATA]'
+        [[ "${STORAGE_READONLY[$index]}" == 1 ]] && marker+=' [READ-ONLY]'
+        [[ "${STORAGE_REMOVABLE[$index]}" == yes ]] && marker+=' [REMOVABLE]'
+        printf '  %d) %s%s\n' "$((index + 1))" "${STORAGE_DEVICE[$index]}" "$marker"
+        item 'Size:' "${STORAGE_SIZE[$index]} (${STORAGE_SIZE_BYTES[$index]} bytes)"
+        item 'Model:' "${STORAGE_MODEL[$index]}"
+        item 'Transport:' "${STORAGE_TRANSPORT[$index]}"
+        item 'Media:' "${STORAGE_MEDIA[$index]}"
+        item 'Removable:' "${STORAGE_REMOVABLE[$index]}"
+        item 'Read-only:' "${STORAGE_READONLY[$index]}"
+        item 'Current table:' "${STORAGE_PTTYPE[$index]}"
+        item 'Metadata:' "${STORAGE_METADATA[$index]}"
+        printf '\n'
+    done
+    if ((${#STORAGE_WARNINGS[@]})); then
+        printf '%bWarnings:%b\n' "$YELLOW" "$RESET"
+        for warning in "${STORAGE_WARNINGS[@]}"; do printf '  - %s\n' "$warning"; done
+    fi
+}
+
+select_disk() {
+    local choice
+    while :; do
+        read -r -p 'Select target disk number: ' choice || fail 'no target disk was selected'
+        [[ "$choice" =~ ^[0-9]+$ ]] || { printf 'Enter one of the displayed disk numbers.\n'; continue; }
+        ((choice >= 1 && choice <= ${#STORAGE_DEVICE[@]})) || { printf 'That disk number is not in the list.\n'; continue; }
+        SELECTED_INDEX=$((choice - 1))
+        if [[ "${STORAGE_METADATA[$SELECTED_INDEX]}" != complete ]]; then
+            printf '%bThe selected disk has incomplete metadata and cannot be safely targeted.%b\n' "$RED" "$RESET"
+            continue
+        fi
+        [[ "${STORAGE_READONLY[$SELECTED_INDEX]}" != 1 ]] || { printf '%bThe selected disk is read-only and cannot be targeted.%b\n' "$RED" "$RESET"; continue; }
+        case "${STORAGE_PTTYPE[$SELECTED_INDEX]}" in
+            none|gpt) ;;
+            *) printf '%bThe selected disk has unsupported or ambiguous partition-table metadata (%s).%b\n' "$RED" "${STORAGE_PTTYPE[$SELECTED_INDEX]}" "$RESET"; continue ;;
+        esac
+        ((STORAGE_SIZE_BYTES[SELECTED_INDEX] > EFI_SIZE_BYTES)) || { printf '%bThe selected disk is too small for a 1 GiB EFI partition and a root partition.%b\n' "$RED" "$RESET"; continue; }
+        break
+    done
+}
+
+validate_username() {
+    [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && [[ "$1" != root ]]
+}
+
+select_account() {
+    local choice
+    while :; do
+        read -r -p 'Administrative username (password setup is deferred): ' choice || fail 'no administrative username was provided'
+        if validate_username "$choice"; then
+            ADMIN_USER="$choice"
+            break
+        fi
+        printf 'Use 1-32 lowercase letters, numbers, underscores, or hyphens; do not use root.\n'
+    done
+}
+
+partition_suffix() {
+    [[ "$(basename "${STORAGE_DEVICE[$SELECTED_INDEX]}")" =~ [0-9]$ ]] && printf p || printf ''
+}
+
+print_preview() {
+    local root_bytes=$((STORAGE_SIZE_BYTES[SELECTED_INDEX] - EFI_SIZE_BYTES)) suffix
+    suffix="$(partition_suffix)"
+    section 'Final plan preview'
+    item 'Selected disk:' "${STORAGE_DEVICE[$SELECTED_INDEX]}"
+    item 'Partition table:' 'GPT (planned)'
+    printf '  1) %s%s1  1 GiB  FAT32  EFI System Partition  /boot/efi\n' "${STORAGE_DEVICE[$SELECTED_INDEX]}" "$suffix"
+    printf '  2) %s%s2  %s  ext4   root partition          /\n' "${STORAGE_DEVICE[$SELECTED_INDEX]}" "$suffix" "$(kiyarch_format_bytes "$root_bytes")"
+    item 'Profile:' "$(kiyarch_profile_field "$PROFILE_ID" display_name)"
+    item 'Packages:' "${#REQUESTED_PACKAGES[@]} official repository packages"
+    item 'Swap:' 'none'
+    item 'Administrator:' "$ADMIN_USER ($USER_SHELL; sudo; root password locked)"
+    item 'Locale/timezone:' "$LOCALE / $TIMEZONE"
+    item 'Keyboard/hostname:' "$KEYBOARD / $HOSTNAME_VALUE"
+    item 'Network:' 'NetworkManager enabled'
+    item 'Encryption:' 'disabled; not part of this layout'
+    item 'Export path:' "$EXPORT_PATH"
+    printf '\n%bThis is a plan only. It will not partition, format, mount, install, or modify the selected disk.%b\n' "$YELLOW" "$RESET"
+}
+
+recheck_selected_disk() {
+    local old_device="${STORAGE_DEVICE[$SELECTED_INDEX]}" old_size="${STORAGE_SIZE_BYTES[$SELECTED_INDEX]}" index
+    kiyarch_collect_storage
+    SELECTED_INDEX=-1
+    for ((index=0; index<${#STORAGE_DEVICE[@]}; index++)); do
+        if [[ "${STORAGE_DEVICE[$index]}" == "$old_device" ]]; then
+            SELECTED_INDEX=$index
+            break
+        fi
+    done
+    ((SELECTED_INDEX >= 0)) || fail 'the selected disk disappeared during planning'
+    [[ "${STORAGE_SIZE_BYTES[$SELECTED_INDEX]}" == "$old_size" ]] || fail 'the selected disk size changed during planning'
+    [[ "${STORAGE_METADATA[$SELECTED_INDEX]}" == complete ]] || fail 'the selected disk metadata is no longer complete'
+    [[ "${STORAGE_READONLY[$SELECTED_INDEX]}" != 1 ]] || fail 'the selected disk became read-only'
+    case "${STORAGE_PTTYPE[$SELECTED_INDEX]}" in
+        none|gpt) ;;
+        *) fail 'the selected disk partition-table metadata changed to an unsupported value' ;;
+    esac
+}
+
+json_warnings() {
+    local -a values=(
+        'This plan is generated by the non-destructive planner.'
+        'No password, private key, token, or other secret is included.'
+        'The executor must revalidate the disk immediately before any operation.'
+    )
+    [[ "${STORAGE_REMOVABLE[$SELECTED_INDEX]}" == yes ]] && values+=("${STORAGE_DEVICE[$SELECTED_INDEX]} is removable media; verify the target before any future execution.")
+    [[ "${STORAGE_MODEL[$SELECTED_INDEX]}" == unknown ]] && values+=('Disk model metadata was unavailable; device path and size were explicitly confirmed.')
+    kiyarch_json_array_strings "${values[@]}"
+}
+
+json_unresolved() {
+    kiyarch_json_array_strings
+}
+
+json_profile_components() {
+    local base="$PROFILE_ID"; [[ "$base" == custom ]] && base="$CUSTOM_BASE"
+    local -a components=(); mapfile -t components < <(kiyarch_profile_array "$base" required_components)
+    kiyarch_json_array_strings "${components[@]}"
+}
+
+json_source_object() {
+    local repository commit source_profile="$PROFILE_ID"
+    [[ "$PROFILE_ID" == custom && "$GRAPHICAL_REQUESTED" == false ]] && { printf 'null\n'; return; }
+    [[ "$source_profile" == custom ]] && source_profile="$CUSTOM_BASE"
+    repository="$(kiyarch_profile_source_repository "$source_profile" || true)"
+    commit="$(kiyarch_profile_source_commit "$source_profile" || true)"
+    if [[ -n "$repository" ]]; then
+        printf '{"repository":%s,"commit":%s}' "$(kiyarch_json_string "$repository")" "$(kiyarch_json_string "$commit")"
+    else
+        printf 'null'
+    fi
+}
+
+print_plan_json() {
+    local root_bytes=$((STORAGE_SIZE_BYTES[SELECTED_INDEX] - EFI_SIZE_BYTES)) suffix base graphical display_manager
+    suffix="$(partition_suffix)"; base="$PROFILE_ID"; [[ "$base" == custom ]] && base="$CUSTOM_BASE"
+    graphical="$(kiyarch_profile_bool "$base" graphical_session)"
+    [[ "$PROFILE_ID" == custom ]] && graphical="$GRAPHICAL_REQUESTED"
+    display_manager='"greetd"'; [[ "$graphical" != true ]] && display_manager=null
+    printf '{\n'
+    printf '  "schema_version":"1.1",\n'
+    printf '  "plan_kind":"kiyarch_install_plan",\n'
+    printf '  "source_hardware":{"architecture":%s,"firmware":%s,"storage_devices_seen":%d,"collector":"kiyarch_shared_hardware"},\n' \
+        "$(kiyarch_json_string "$KIYARCH_ARCH")" "$(kiyarch_json_string "$KIYARCH_FIRMWARE")" "${#STORAGE_DEVICE[@]}"
+    printf '  "target_disk":{"device":%s,"size":%s,"size_bytes":%s,"model":%s,"transport":%s,"storage_class":%s,"media":%s,"serial":%s,"wwn":%s,"removable":%s,"readonly":false,"current_partition_table":%s},\n' \
+        "$(kiyarch_json_string "${STORAGE_DEVICE[$SELECTED_INDEX]}")" "$(kiyarch_json_string "${STORAGE_SIZE[$SELECTED_INDEX]}")" "${STORAGE_SIZE_BYTES[$SELECTED_INDEX]}" \
+        "$(kiyarch_json_string "${STORAGE_MODEL[$SELECTED_INDEX]}")" "$(kiyarch_json_string "${STORAGE_TRANSPORT[$SELECTED_INDEX]}")" "$(kiyarch_json_string "${STORAGE_CLASS[$SELECTED_INDEX]}")" \
+        "$(kiyarch_json_string "${STORAGE_MEDIA[$SELECTED_INDEX]}")" "$(kiyarch_json_string "${STORAGE_SERIAL[$SELECTED_INDEX]:-unknown}")" "$(kiyarch_json_string "${STORAGE_WWN[$SELECTED_INDEX]:-unknown}")" "$(kiyarch_json_bool "${STORAGE_REMOVABLE[$SELECTED_INDEX]}")" "$(kiyarch_json_string "${STORAGE_PTTYPE[$SELECTED_INDEX]}")"
+    printf '  "firmware_policy":{"required":"uefi","boot_mode":"uefi","partition_table":"gpt"},\n'
+    printf '  "partition_layout":{"disk_label":"gpt","partitions":[{"number":1,"device":%s,"role":"efi_system_partition","size":"1 GiB","size_bytes":%d,"filesystem":"fat32","mountpoint":"/boot/efi"},{"number":2,"device":%s,"role":"root","size":"remaining","size_bytes":%d,"filesystem":"ext4","mountpoint":"/"}]},\n' \
+        "$(kiyarch_json_string "${STORAGE_DEVICE[$SELECTED_INDEX]}${suffix}1")" "$EFI_SIZE_BYTES" \
+        "$(kiyarch_json_string "${STORAGE_DEVICE[$SELECTED_INDEX]}${suffix}2")" "$root_bytes"
+    printf '  "filesystem_policy":{"efi":"fat32","root":"ext4","swap":"none"},\n'
+    printf '  "install_profile":{"id":%s,"display_name":%s,"manifest_version":"1","manifest_hash":%s,"base_profile":%s,"components":%s,"additional_packages":%s,"package_source":"official_arch_repositories","caelestia_source":%s},\n' \
+        "$(kiyarch_json_string "$PROFILE_ID")" "$(kiyarch_json_string "$(kiyarch_profile_field "$PROFILE_ID" display_name)")" \
+        "$(kiyarch_json_string "$(kiyarch_profile_hash "$PROFILE_ID")")" "$(kiyarch_json_string "$base")" "$(json_profile_components)" "$(kiyarch_json_array_strings "${ADDITIONAL_PACKAGES[@]}")" "$(json_source_object)"
+    printf '  "locale":%s,\n  "keyboard_layout":%s,\n  "timezone":%s,\n  "hostname":%s,\n' \
+        "$(kiyarch_json_string "$LOCALE")" "$(kiyarch_json_string "$KEYBOARD")" "$(kiyarch_json_string "$TIMEZONE")" "$(kiyarch_json_string "$HOSTNAME_VALUE")"
+    printf '  "network_policy":{"stack":"NetworkManager","enable_service":true},\n'
+    printf '  "account_policy":{"username":%s,"shell":%s,"sudo":true,"root_password":"locked","secrets_included":false},\n' "$(kiyarch_json_string "$ADMIN_USER")" "$(kiyarch_json_string "$USER_SHELL")"
+    printf '  "session_policy":{"graphical":%s,"display_manager":%s,"greetd_enabled":%s},\n' "$graphical" "$display_manager" "$graphical"
+    printf '  "requested_packages":%s,\n  "resolved_package_availability":{"status":%s,"source":"official_arch_repositories"},\n' "$(kiyarch_json_array_strings "${REQUESTED_PACKAGES[@]}")" "$(kiyarch_json_string "$RESOLVED_PACKAGE_STATUS")"
+    printf '  "account_configuration":{"administrative_user":%s,"root_availability":"locked_password","credential_setup":"execution_only","secrets_included":false},\n' "$(kiyarch_json_string "$ADMIN_USER")"
+    printf '  "desktop_profile":{"id":%s,"status":"selected","package_installation":"requested"},\n' "$(kiyarch_json_string "$PROFILE_ID")"
+    printf '  "encryption":{"enabled":false,"status":"disabled"},\n'
+    printf '  "execution":{"mode":"planner_only","executor_enabled":false,"mutates_target_disk":false},\n'
+    printf '  "warnings":%s,\n' "$(json_warnings)"
+    printf '  "unresolved_decisions":%s\n' "$(json_unresolved)"
+    printf '}\n'
+}
+
+export_plan() {
+    local output_dir temp_path
+    output_dir="$(dirname "$EXPORT_PATH")"
+    [[ -d "$output_dir" ]] || mkdir -p "$output_dir" || fail "cannot create export directory: $output_dir"
+    temp_path="${EXPORT_PATH}.tmp.$$"
+    if ! (umask 077; print_plan_json > "$temp_path"); then
+        rm -f "$temp_path"
+        fail "cannot write plan: $EXPORT_PATH"
+    fi
+    "$PLAN_VALIDATOR" --validate "$temp_path" || {
+        rm -f "$temp_path"
+        fail 'generated plan failed validation and was not exported'
+    }
+    mv -f "$temp_path" "$EXPORT_PATH" || { rm -f "$temp_path"; fail "cannot finalize plan: $EXPORT_PATH"; }
+    printf '%bPlan exported:%b %s\n' "$GREEN" "$RESET" "$EXPORT_PATH"
+}
+
+if [[ "${KIYARCH_INSTALL_LIBRARY_ONLY:-0}" == 1 ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+kiyarch_collect_platform
+CPU_VENDOR_ID="$(awk -F: '/^vendor_id[[:space:]]*:/ {gsub(/^[[:space:]]+/,"",$2);print $2;exit}' /proc/cpuinfo 2>/dev/null)"
+case "$CPU_VENDOR_ID" in GenuineIntel) MICROCODE_PACKAGE=intel-ucode;; AuthenticAMD) MICROCODE_PACKAGE=amd-ucode;; esac
+print_preflight
+select_profile
+prompt_custom
+prompt_settings
+build_package_list
+package_preflight
+kiyarch_collect_storage
+print_disks
+select_disk
+print_preview
+if [[ "${STORAGE_REMOVABLE[$SELECTED_INDEX]}" == yes ]]; then
+    printf '\n%bRemovable-media warning:%b type %bI UNDERSTAND THIS IS REMOVABLE MEDIA%b to continue: ' "$YELLOW" "$RESET" "$BOLD" "$RESET"
+    read -r removable_confirmation || fail 'removable-media confirmation was not provided'
+    [[ "$removable_confirmation" == 'I UNDERSTAND THIS IS REMOVABLE MEDIA' ]] || { printf 'Plan export cancelled. No target disk changes were made.\n'; exit 0; }
+fi
+printf '\nType %bCREATE PLANNER-ONLY PLAN%b to export this exact plan, or anything else to cancel: ' "$BOLD" "$RESET"
+read -r confirmation || fail 'confirmation was not provided'
+[[ "$confirmation" == 'CREATE PLANNER-ONLY PLAN' ]] || { printf 'Plan export cancelled. No target disk changes were made.\n'; exit 0; }
+recheck_selected_disk
+export_plan

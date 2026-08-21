@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+on_error() {
+    local rc=$?
+    printf '\033[31mKiyArch installation failed at line %s: %s\033[0m\n' "$1" "$BASH_COMMAND" >&2
+    exit "$rc"
+}
+trap 'on_error "$LINENO"' ERR
+
+# Separate destructive executor. The planner never sources this command.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for LIB in /usr/local/lib/kiyarch-hardware.sh "$SCRIPT_DIR/../lib/kiyarch-hardware.sh"; do
+    [[ -r "$LIB" ]] && source "$LIB" && break
+done
+for LIB in /usr/local/lib/kiyarch-profiles.sh "$SCRIPT_DIR/../lib/kiyarch-profiles.sh"; do
+    [[ -r "$LIB" ]] && source "$LIB" && break
+done
+kiyarch_profiles_init >/dev/null 2>&1 || { printf 'kiyarch-execute: profile manifests unavailable\n' >&2; exit 1; }
+
+RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; RESET='\033[0m'
+PLAN_PATH=""; DRY_RUN=false; TARGET=""; TARGET_INDEX=-1; PROFILE_ID=""; PROFILE_APPLY_ID=""; USER_NAME=""; USER_SHELL="zsh"
+LOCALE=""; KEYBOARD=""; TIMEZONE=""; HOSTNAME_VALUE=""; GRAPHICAL=false; PACKAGE_STATUS=""; NVRAM_STATUS="unknown"; ROOT_MOUNT=/mnt
+LOG_PATH=/run/kiyarch/install-execution.log
+
+usage() {
+    cat <<'USAGE'
+Usage: kiyarch-execute --plan /absolute/path/plan.json [--dry-run]
+
+Accepts only a validated schema 1.1 plan. Without --dry-run it erases one
+revalidated UEFI target using GPT/FAT32/ext4.
+USAGE
+}
+fail() { printf '%bINSTALLATION INCOMPLETE%b\n%bERROR:%b %s\nDo NOT reboot yet.\n' "$RED" "$RESET" "$RED" "$RESET" "$1" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+plan_field() { local field="$1"; sed -nE 's/^[[:space:]]*"'"$field"'"[[:space:]]*:[[:space:]]*"([^"]*)"[,]?.*$/\1/p' "$PLAN_PATH" | head -n1; }
+plan_bool() { local field="$1"; sed -nE 's/^[[:space:]]*"'"$field"'"[[:space:]]*:[[:space:]]*(true|false)[,]?.*$/\1/p' "$PLAN_PATH" | head -n1; }
+json_array_values() { local field="$1" line values; line="$(grep -E '^[[:space:]]*"'"$field"'"[[:space:]]*:[[:space:]]*\[' "$PLAN_PATH" | head -n1)"; values="${line#*[}"; values="${values%]*}"; values="${values//\"/}"; values="${values//,/ }"; for value in $values; do [[ -n "$value" ]] && printf '%s\n' "$value"; done; }
+
+while (($#)); do
+    case "$1" in
+        --plan) (($# >= 2)) || fail '--plan requires a path'; PLAN_PATH="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+[[ "$PLAN_PATH" == /* && -f "$PLAN_PATH" && -r "$PLAN_PATH" ]] || fail 'plan must be an absolute readable regular file'
+[[ "$(id -u)" == 0 ]] || fail 'executor must run as root'
+
+validate_plan() {
+    local schema manifest_hash expected_hash source_commit expected_commit
+    schema="$(plan_field schema_version)"
+    [[ "$schema" == 1.1 ]] || fail 'destructive executor accepts schema 1.1 only'
+    grep -Eq '^[[:space:]]*"plan_kind"[[:space:]]*:[[:space:]]*"kiyarch_install_plan"' "$PLAN_PATH" || fail 'plan kind is invalid'
+    grep -Eq '"mode"[[:space:]]*:[[:space:]]*"planner_only"' "$PLAN_PATH" || fail 'plan execution mode is invalid'
+    grep -Eq '"executor_enabled"[[:space:]]*:[[:space:]]*false' "$PLAN_PATH" || fail 'plan has executor_enabled=true'
+    grep -Eq '"mutates_target_disk"[[:space:]]*:[[:space:]]*false' "$PLAN_PATH" || fail 'plan mutation flag is invalid'
+    grep -Eq '"required"[[:space:]]*:[[:space:]]*"uefi"' "$PLAN_PATH" || fail 'plan requires UEFI'
+    grep -Eq '"partition_table"[[:space:]]*:[[:space:]]*"gpt"' "$PLAN_PATH" || fail 'plan requires GPT'
+    grep -Eq '"filesystem"[[:space:]]*:[[:space:]]*"fat32"' "$PLAN_PATH" || fail 'plan lacks FAT32 EFI policy'
+    grep -Eq '"filesystem"[[:space:]]*:[[:space:]]*"ext4"' "$PLAN_PATH" || fail 'plan lacks ext4 root policy'
+    grep -Eq '"swap"[[:space:]]*:[[:space:]]*"none"' "$PLAN_PATH" || fail 'swap is not disabled'
+    grep -Eiq '"(password|private_key|token)"[[:space:]]*:' "$PLAN_PATH" && fail 'plan contains a secret field'
+    PROFILE_ID="$(sed -nE 's/.*"install_profile"[[:space:]]*:[[:space:]]*\{[[:space:]]*"id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    [[ "$PROFILE_ID" =~ ^(minimal|laptop|desktop|hyprland-caelestia|custom)$ ]] || fail 'install profile id is invalid'
+    PROFILE_APPLY_ID="$(sed -nE 's/.*"install_profile"[[:space:]]*:[[:space:]]*\{[^}]*"base_profile"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    [[ -n "$PROFILE_APPLY_ID" ]] || PROFILE_APPLY_ID="$PROFILE_ID"
+    [[ "$PROFILE_APPLY_ID" =~ ^(minimal|laptop|desktop|hyprland-caelestia)$ ]] || fail 'base profile is invalid'
+    kiyarch_profile_validate_manifest "$PROFILE_ID" 2>/dev/null || fail 'selected profile manifest is invalid'
+    manifest_hash="$(sed -nE 's/.*"install_profile"[[:space:]]*:[[:space:]]*\{[^}]*"manifest_hash"[[:space:]]*:[[:space:]]*"(sha256:[0-9a-f]{64})".*/\1/p' "$PLAN_PATH" | head -n1)"
+    expected_hash="$(kiyarch_profile_hash "$PROFILE_ID")"; [[ "$manifest_hash" == "$expected_hash" ]] || fail 'profile manifest hash does not match the live manifest'
+    source_commit="$(sed -nE 's/.*"caelestia_source"[[:space:]]*:[[:space:]]*\{[^}]*"commit"[[:space:]]*:[[:space:]]*"([0-9a-f]{40})".*/\1/p' "$PLAN_PATH" | head -n1)"
+    if [[ -n "$source_commit" && "$PROFILE_ID" != custom ]]; then
+        expected_commit="$(kiyarch_profile_source_commit "$PROFILE_ID" || true)"; [[ "$source_commit" == "$expected_commit" ]] || fail 'Caelestia source commit does not match the live manifest'
+    fi
+    USER_NAME="$(sed -nE 's/.*"account_policy"[[:space:]]*:[[:space:]]*\{[^}]*"username"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    [[ "$USER_NAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$USER_NAME" != root ]] || fail 'account username is invalid'
+    USER_SHELL="$(sed -nE 's/.*"account_policy"[[:space:]]*:[[:space:]]*\{[^}]*"shell"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    [[ "$USER_SHELL" =~ ^(bash|zsh|fish)$ ]] || fail 'account shell is invalid'
+    LOCALE="$(plan_field locale)"; KEYBOARD="$(plan_field keyboard_layout)"; TIMEZONE="$(plan_field timezone)"; HOSTNAME_VALUE="$(plan_field hostname)"
+    [[ "$LOCALE" =~ ^[A-Za-z0-9_.@+-]+$ && "$KEYBOARD" =~ ^[a-zA-Z0-9_-]+$ && "$TIMEZONE" != /* && "$TIMEZONE" != *..* && "$HOSTNAME_VALUE" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]] || fail 'locale, keyboard, timezone, or hostname policy is invalid'
+    PACKAGE_STATUS="$(sed -nE 's/.*"resolved_package_availability"[[:space:]]*:[[:space:]]*\{[^}]*"status"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    [[ "$PACKAGE_STATUS" == verified ]] || fail 'executor requires packages to have passed planner preflight'
+    GRAPHICAL="$(sed -nE 's/.*"session_policy"[[:space:]]*:[[:space:]]*\{[^}]*"graphical"[[:space:]]*:[[:space:]]*(true|false).*/\1/p' "$PLAN_PATH" | head -n1)"
+    [[ "$GRAPHICAL" == true || "$GRAPHICAL" == false ]] || fail 'session policy is invalid'
+}
+
+read_plan_packages() {
+    mapfile -t REQUESTED_PACKAGES < <(json_array_values requested_packages)
+    ((${#REQUESTED_PACKAGES[@]})) || fail 'requested package list is empty'
+    kiyarch_validate_package_list "${REQUESTED_PACKAGES[@]}" || fail 'plan contains an invalid package name'
+}
+
+source_preflight() {
+    local package repo commit
+    have pacman || fail 'pacman is unavailable'
+    [[ -s /etc/pacman.conf && -s /etc/pacman.d/mirrorlist ]] || fail 'pacman mirror configuration is missing'
+    if have getent && ! getent hosts archlinux.org >/dev/null 2>&1; then fail 'network/DNS preflight failed'; fi
+    pacman -Sy --noconfirm >/dev/null 2>&1 || fail 'official repository metadata could not be refreshed'
+    for package in "${REQUESTED_PACKAGES[@]}"; do
+        pacman -Sp --noconfirm --needed --print-format '%n' "$package" >/dev/null 2>&1 || fail "package unavailable in official Arch repositories: $package"
+    done
+    printf '  staging verified packages before any disk changes...\n'
+    pacman -Sw --noconfirm --needed --disable-download-timeout "${REQUESTED_PACKAGES[@]}" || fail 'package download preflight failed; no disk changes were made'
+    printf 'Package download preflight passed.\n'
+    if grep -Eq '"caelestia_source"[[:space:]]*:[[:space:]]*\{' "$PLAN_PATH"; then
+        repo='https://github.com/caelestia-dots/shell'
+        commit="$(sed -nE 's/.*"commit"[[:space:]]*:[[:space:]]*"([0-9a-f]{40})".*/\1/p' "$PLAN_PATH" | head -n1)"
+        [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail 'Caelestia commit is not immutable'
+        have git || fail 'git is unavailable for Caelestia source verification'
+        git ls-remote "$repo" "$commit^{commit}" | awk -v commit="$commit" '$1 == commit { found=1 } END { exit !found }' || fail 'pinned Caelestia source commit is unavailable'
+    fi
+}
+
+recollect_target() {
+    local planned_device planned_size planned_model planned_transport planned_media planned_serial planned_wwn planned_pttype index live_source
+    planned_device="$(sed -nE 's/.*"target_disk"[[:space:]]*:[[:space:]]*\{[^}]*"device"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    planned_size="$(sed -nE 's/.*"target_disk"[[:space:]]*:[[:space:]]*\{[^}]*"size_bytes"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$PLAN_PATH" | head -n1)"
+    planned_model="$(sed -nE 's/.*"target_disk"[[:space:]]*:[[:space:]]*\{[^}]*"model"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    planned_transport="$(sed -nE 's/.*"target_disk"[[:space:]]*:[[:space:]]*\{[^}]*"transport"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    planned_media="$(sed -nE 's/.*"target_disk"[[:space:]]*:[[:space:]]*\{[^}]*"media"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    planned_serial="$(sed -nE 's/.*"target_disk"[[:space:]]*:[[:space:]]*\{[^}]*"serial"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    planned_wwn="$(sed -nE 's/.*"target_disk"[[:space:]]*:[[:space:]]*\{[^}]*"wwn"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    planned_pttype="$(sed -nE 's/.*"target_disk"[[:space:]]*:[[:space:]]*\{[^}]*"current_partition_table"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
+    [[ "$planned_device" == /dev/* && "$planned_size" =~ ^[0-9]+$ ]] || fail 'target disk identity is incomplete'
+    kiyarch_collect_platform; [[ "$KIYARCH_FIRMWARE" == uefi ]] || fail 'legacy BIOS cannot be installed by this executor'
+    kiyarch_collect_storage
+    for ((index=0; index<${#STORAGE_DEVICE[@]}; index++)); do
+        [[ "${STORAGE_DEVICE[$index]}" == "$planned_device" ]] || continue
+        TARGET_INDEX=$index; break
+    done
+    ((TARGET_INDEX >= 0)) || fail 'planned target disk is no longer present'
+    TARGET="${STORAGE_DEVICE[$TARGET_INDEX]}"
+    [[ "${STORAGE_SIZE_BYTES[$TARGET_INDEX]}" == "$planned_size" && "${STORAGE_MODEL[$TARGET_INDEX]}" == "$planned_model" && "${STORAGE_TRANSPORT[$TARGET_INDEX]}" == "$planned_transport" && "${STORAGE_MEDIA[$TARGET_INDEX]}" == "$planned_media" && "${STORAGE_PTTYPE[$TARGET_INDEX]}" == "$planned_pttype" ]] || fail 'target disk metadata changed since planning'
+    [[ -z "$planned_serial" || "$planned_serial" == unknown || "${STORAGE_SERIAL[$TARGET_INDEX]:-unknown}" == "$planned_serial" ]] || fail 'target disk serial changed since planning'
+    [[ -z "$planned_wwn" || "$planned_wwn" == unknown || "${STORAGE_WWN[$TARGET_INDEX]:-unknown}" == "$planned_wwn" ]] || fail 'target disk WWN changed since planning'
+    [[ "${STORAGE_METADATA[$TARGET_INDEX]}" == complete && "${STORAGE_READONLY[$TARGET_INDEX]}" != 1 && "${STORAGE_REMOVABLE[$TARGET_INDEX]}" != yes ]] || fail 'target disk is ambiguous, read-only, or removable'
+    [[ -b "$TARGET" ]] || fail 'target is not a block device'
+    [[ "$TARGET" != /dev/loop* && "$TARGET" != /dev/sr* ]] || fail 'live media or loop device cannot be an installation target'
+    if findmnt -rn -S "$TARGET" >/dev/null 2>&1 || lsblk -nrpo MOUNTPOINT "$TARGET" 2>/dev/null | awk 'NF { found=1 } END { exit !found }'; then fail 'target or one of its partitions is mounted'; fi
+    live_source="$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null || true)"
+    [[ -z "$live_source" || "$live_source" != "$TARGET" ]] || fail 'target is the live media'
+}
+
+confirm_target() {
+    local expected answer
+    expected="I CONFIRM $TARGET ${STORAGE_SIZE[$TARGET_INDEX]}"
+    printf '\n%bFINAL TARGET%b\n  Device: %s\n  Size: %s\n  Model: %s\n  Profile: %s\n' "$YELLOW" "$RESET" "$TARGET" "${STORAGE_SIZE[$TARGET_INDEX]}" "${STORAGE_MODEL[$TARGET_INDEX]}" "$(kiyarch_profile_field "$PROFILE_ID" display_name)"
+    printf '\nThis creates GPT, erases the disk, and creates one FAT32 EFI and one ext4 root partition.\n'
+    read -r -p "Type exactly '$expected': " answer || fail 'device confirmation was not provided'
+    [[ "$answer" == "$expected" ]] || fail 'device-and-size confirmation did not match'
+    read -r -p 'Type exactly ERASE THIS DISK to acknowledge the destructive operation: ' answer || fail 'destructive confirmation was not provided'
+    [[ "$answer" == 'ERASE THIS DISK' ]] || fail 'destructive confirmation did not match'
+}
+
+partition_devices() {
+    if [[ "$(basename "$TARGET")" =~ [0-9]$ ]]; then
+        EFI_PART="${TARGET}p1"; ROOT_PART="${TARGET}p2"
+    else
+        EFI_PART="${TARGET}1"; ROOT_PART="${TARGET}2"
+    fi
+}
+
+install_filesystems() {
+    have sgdisk && have wipefs && have mkfs.fat && have mkfs.ext4 || fail 'fixed-layout disk tools are unavailable'
+    wipefs -a "$TARGET"
+    sgdisk --zap-all --clear --new=1:0:+1G --typecode=1:ef00 --change-name=1:'KiyArch EFI' --new=2:0:0 --typecode=2:8300 --change-name=2:'KiyArch root' "$TARGET"
+    partprobe "$TARGET" 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+    [[ -b "$EFI_PART" && -b "$ROOT_PART" ]] || fail 'partitioning did not create both expected partition devices'
+    sgdisk --print "$TARGET" >/dev/null || fail 'partition table cannot be read after partitioning'
+    sgdisk --info=1 "$TARGET" | grep -Eiq 'partition guid code:[[:space:]]*(ef00|c12a7328-f81f-11d2-ba4b-00a0c93ec93b)' || fail 'EFI partition type is incorrect'
+    sgdisk --info=2 "$TARGET" | grep -Eiq 'partition guid code:[[:space:]]*(8300|0fc63daf-8483-4772-8e79-3d69d8477de4)' || fail 'root partition type is incorrect'
+    mkfs.fat -F32 -n KIYARCH_EFI "$EFI_PART"
+    mkfs.ext4 -F -L KiyArchRoot "$ROOT_PART"
+    [[ "$(blkid -s TYPE -o value "$EFI_PART")" == vfat ]] || fail 'EFI filesystem is not FAT32/vfat after formatting'
+    [[ "$(blkid -s TYPE -o value "$ROOT_PART")" == ext4 ]] || fail 'root filesystem is not ext4 after formatting'
+    mount "$ROOT_PART" "$ROOT_MOUNT"
+    mkdir -p "$ROOT_MOUNT/boot/efi"
+    mount "$EFI_PART" "$ROOT_MOUNT/boot/efi"
+    [[ "$(findmnt -no SOURCE --target "$ROOT_MOUNT")" == "$ROOT_PART" ]] || fail 'root filesystem mounted at an unexpected source'
+    [[ "$(findmnt -no SOURCE --target "$ROOT_MOUNT/boot/efi")" == "$EFI_PART" ]] || fail 'EFI filesystem mounted at an unexpected source'
+}
+
+enable_profile_services() {
+    local service
+    mapfile -t PROFILE_SERVICES < <(kiyarch_profile_array "$PROFILE_APPLY_ID" services)
+    ((${#PROFILE_SERVICES[@]})) || fail 'selected profile declares no services'
+    for service in "${PROFILE_SERVICES[@]}"; do
+        [[ "$service" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || fail "invalid service in profile manifest: $service"
+        arch-chroot "$ROOT_MOUNT" systemctl enable "$service"
+    done
+}
+
+ensure_esp_mounted() {
+    local mounted_source mounted_type
+    mkdir -p "$ROOT_MOUNT/boot/efi"
+    mounted_source="$(findmnt -no SOURCE --target "$ROOT_MOUNT/boot/efi" 2>/dev/null || true)"
+    if [[ -n "$mounted_source" && "$mounted_source" != "$EFI_PART" ]]; then
+        fail "unexpected filesystem is mounted at the EFI path: $mounted_source"
+    fi
+    if [[ "$mounted_source" != "$EFI_PART" ]]; then
+        mount "$EFI_PART" "$ROOT_MOUNT/boot/efi"
+    fi
+    mounted_source="$(findmnt -no SOURCE --target "$ROOT_MOUNT/boot/efi" 2>/dev/null || true)"
+    mounted_type="$(findmnt -no FSTYPE --target "$ROOT_MOUNT/boot/efi" 2>/dev/null || true)"
+    [[ "$mounted_source" == "$EFI_PART" && "$mounted_type" == vfat ]] || fail 'EFI filesystem is not mounted as the expected FAT32 ESP'
+}
+
+install_system() {
+    local packages_string package
+    packages_string="${REQUESTED_PACKAGES[*]}"
+    pacstrap -K -c "$ROOT_MOUNT" $packages_string
+    [[ -d "$ROOT_MOUNT/etc" && -d "$ROOT_MOUNT/usr" ]] || fail 'pacstrap did not create the Arch filesystem tree'
+    [[ -x "$ROOT_MOUNT/usr/lib/systemd/systemd" || -x "$ROOT_MOUNT/usr/bin/systemd" || -x "$ROOT_MOUNT/usr/bin/init" ]] || fail 'pacstrap did not install a usable systemd/init executable'
+    [[ -s "$ROOT_MOUNT/boot/vmlinuz-linux" ]] || fail 'pacstrap did not install the Linux kernel'
+    genfstab -U "$ROOT_MOUNT" >> "$ROOT_MOUNT/etc/fstab"
+    [[ -s "$ROOT_MOUNT/etc/fstab" ]] || fail 'genfstab did not create fstab'
+    mkdir -p "$ROOT_MOUNT/etc"
+    printf '%s\n' "$LOCALE" > "$ROOT_MOUNT/etc/locale.conf"
+    printf '%s\n' "$HOSTNAME_VALUE" > "$ROOT_MOUNT/etc/hostname"
+    mkdir -p "$ROOT_MOUNT/etc/vconsole.conf.d"
+    printf 'KEYMAP=%s\n' "$KEYBOARD" > "$ROOT_MOUNT/etc/vconsole.conf"
+    arch-chroot "$ROOT_MOUNT" ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+    arch-chroot "$ROOT_MOUNT" hwclock --systohc
+    arch-chroot "$ROOT_MOUNT" sed -i "s/^#\($LOCALE[[:space:]]*UTF-8\)/\1/" /etc/locale.gen
+    arch-chroot "$ROOT_MOUNT" locale-gen
+    arch-chroot "$ROOT_MOUNT" useradd -m -U -G wheel -s "/usr/bin/$USER_SHELL" "$USER_NAME"
+    printf '%s ALL=(ALL:ALL) ALL\n' "$USER_NAME" > "$ROOT_MOUNT/etc/sudoers.d/10-kiyarch-$USER_NAME"
+    chmod 0440 "$ROOT_MOUNT/etc/sudoers.d/10-kiyarch-$USER_NAME"
+    arch-chroot "$ROOT_MOUNT" passwd --lock root
+    enable_profile_services
+    arch-chroot "$ROOT_MOUNT" mkinitcpio -P
+    configure_boot
+    configure_session
+    if [[ -f "$ROOT_MOUNT/etc/skel/.config/hypr/hyprland.conf" ]]; then
+        mkdir -p "$ROOT_MOUNT/home/$USER_NAME/.config/hypr"
+        cp "$ROOT_MOUNT/etc/skel/.config/hypr/hyprland.conf" "$ROOT_MOUNT/home/$USER_NAME/.config/hypr/hyprland.conf"
+        arch-chroot "$ROOT_MOUNT" chown -R "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.config"
+    fi
+}
+
+configure_boot() {
+    local root_uuid efi_uuid kernel initramfs microcode microcode_name=''
+    root_uuid="$(blkid -s UUID -o value "$ROOT_PART")"; efi_uuid="$(blkid -s UUID -o value "$EFI_PART")"
+    [[ -n "$root_uuid" && -n "$efi_uuid" ]] || fail 'filesystem UUID collection failed'
+    kernel="$ROOT_MOUNT/boot/vmlinuz-linux"
+    initramfs="$ROOT_MOUNT/boot/initramfs-linux.img"
+    [[ -s "$kernel" && -s "$initramfs" ]] || fail 'kernel or initramfs is missing before bootloader configuration'
+    ensure_esp_mounted
+    mkdir -p "$ROOT_MOUNT/boot/efi/loader/entries"
+    # With the ESP mounted at /boot/efi, systemd-boot can only read boot
+    # artifacts from the ESP. Keep the installed root copy for package
+    # ownership and put the bootable copies beside the loader entries.
+    cp -f "$kernel" "$ROOT_MOUNT/boot/efi/vmlinuz-linux"
+    cp -f "$initramfs" "$ROOT_MOUNT/boot/efi/initramfs-linux.img"
+    for microcode in "$ROOT_MOUNT"/boot/*-ucode.img; do
+        [[ -s "$microcode" ]] || continue
+        cp -f "$microcode" "$ROOT_MOUNT/boot/efi/$(basename "$microcode")"
+        microcode_name="/$(basename "$microcode")"
+    done
+    if bootctl --root="$ROOT_MOUNT" --esp-path=/boot/efi install; then
+        NVRAM_STATUS=registered
+    else
+        NVRAM_STATUS=fallback-only
+        bootctl --graceful --root="$ROOT_MOUNT" --esp-path=/boot/efi install || fail 'systemd-boot installation failed, including fallback mode'
+        printf '%bWARNING:%b UEFI NVRAM registration was unavailable; the EFI fallback path will be used.\n' "$YELLOW" "$RESET"
+    fi
+    printf 'default kiyarch.conf\ntimeout 5\neditor no\nauto-firmware yes\n' > "$ROOT_MOUNT/boot/efi/loader/loader.conf"
+    if [[ -n "$microcode_name" ]]; then
+        printf 'title KiyArch\nlinux /vmlinuz-linux\ninitrd %s\ninitrd /initramfs-linux.img\noptions root=UUID=%s rw\n' "$microcode_name" "$root_uuid" > "$ROOT_MOUNT/boot/efi/loader/entries/kiyarch.conf"
+    else
+        printf 'title KiyArch\nlinux /vmlinuz-linux\ninitrd /initramfs-linux.img\noptions root=UUID=%s rw\n' "$root_uuid" > "$ROOT_MOUNT/boot/efi/loader/entries/kiyarch.conf"
+    fi
+    [[ -s "$ROOT_MOUNT/boot/efi/EFI/systemd/systemd-bootx64.efi" ]] || fail 'systemd-boot EFI executable was not installed on the ESP'
+    [[ -s "$ROOT_MOUNT/boot/efi/EFI/BOOT/BOOTX64.EFI" ]] || fail 'systemd-boot fallback EFI executable was not installed on the ESP'
+    [[ -s "$ROOT_MOUNT/boot/efi/loader/loader.conf" && -s "$ROOT_MOUNT/boot/efi/loader/entries/kiyarch.conf" ]] || fail 'systemd-boot loader configuration is incomplete'
+}
+
+configure_session() {
+    [[ "$GRAPHICAL" == true ]] || return 0
+    mkdir -p "$ROOT_MOUNT/etc/greetd" "$ROOT_MOUNT/etc/skel/.config/hypr"
+    printf '[terminal]\nvt = 1\n\n[default_session]\ncommand = "tuigreet --cmd Hyprland"\nuser = "greeter"\n' > "$ROOT_MOUNT/etc/greetd/config.toml"
+    : > "$ROOT_MOUNT/etc/skel/.config/hypr/hyprland.conf"
+    if grep -Eq '"caelestia_source"[[:space:]]*:[[:space:]]*\{' "$PLAN_PATH"; then
+        printf 'exec-once = qs -c caelestia -n -d\n' > "$ROOT_MOUNT/etc/skel/.config/hypr/hyprland.conf"
+        have git && have cmake && have ninja || fail 'Caelestia build tools are unavailable'
+        mkdir -p "$ROOT_MOUNT/opt"
+        git clone 'https://github.com/caelestia-dots/shell' "$ROOT_MOUNT/opt/caelestia-shell"
+        local commit; commit="$(sed -nE 's/.*"commit"[[:space:]]*:[[:space:]]*"([0-9a-f]{40})".*/\1/p' "$PLAN_PATH" | head -n1)"
+        git -C "$ROOT_MOUNT/opt/caelestia-shell" checkout --detach "$commit"
+        arch-chroot "$ROOT_MOUNT" cmake -S /opt/caelestia-shell -B /opt/caelestia-shell/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/
+        arch-chroot "$ROOT_MOUNT" cmake --build /opt/caelestia-shell/build
+        arch-chroot "$ROOT_MOUNT" cmake --install /opt/caelestia-shell/build
+        printf '%s\n' "$commit" > "$ROOT_MOUNT/opt/caelestia-shell/KIYARCH_COMMIT"
+    fi
+}
+
+collect_credentials_input() {
+    local password verify
+    printf '\nCredentials are read silently and are never written to the plan or log.\n'
+    read -r -s -p "Password for $USER_NAME: " password; printf '\n'
+    read -r -s -p 'Repeat password: ' verify; printf '\n'
+    [[ -n "$password" && "$password" == "$verify" ]] || fail 'passwords did not match or were empty'
+    INSTALL_PASSWORD="$password"
+    unset password verify
+}
+
+collect_credentials() {
+    [[ -n "${INSTALL_PASSWORD:-}" ]] || fail 'installation password was not collected'
+    printf '%s:%s\n' "$USER_NAME" "$INSTALL_PASSWORD" | arch-chroot "$ROOT_MOUNT" chpasswd
+    unset INSTALL_PASSWORD
+}
+
+post_validate() {
+    local root_lock enabled commit service locale_value locale_expected sudo_file root_source esp_source
+    local -i step=0
+    step=$((step + 1)); printf '[%d/8] Root filesystem ............ ' "$step"
+    root_source="$(findmnt -no SOURCE --target "$ROOT_MOUNT" 2>/dev/null || true)"
+    [[ "$root_source" == "$ROOT_PART" && -d "$ROOT_MOUNT/etc" && -d "$ROOT_MOUNT/usr" ]] || fail 'installed root filesystem is not mounted or is incomplete'
+    printf 'OK\n'
+
+    step=$((step + 1)); printf '[%d/8] EFI System Partition ....... ' "$step"
+    esp_source="$(findmnt -no SOURCE --target "$ROOT_MOUNT/boot/efi" 2>/dev/null || true)"
+    [[ "$esp_source" == "$EFI_PART" && "$(blkid -s TYPE -o value "$EFI_PART")" == vfat ]] || fail 'EFI System Partition is not mounted or is not FAT32'
+    [[ -s "$ROOT_MOUNT/boot/efi/EFI/systemd/systemd-bootx64.efi" ]] || fail 'systemd-boot EFI executable is missing'
+    [[ -s "$ROOT_MOUNT/boot/efi/EFI/BOOT/BOOTX64.EFI" ]] || fail 'systemd-boot fallback EFI executable is missing'
+    printf 'OK\n'
+
+    step=$((step + 1)); printf '[%d/8] fstab ...................... ' "$step"
+    [[ -s "$ROOT_MOUNT/etc/fstab" ]] || fail 'fstab was not generated'
+    grep -Eq '^[[:space:]]*(UUID=|PARTUUID=)[^[:space:]]+[[:space:]]+/[[:space:]]+ext4([[:space:]]|$)' "$ROOT_MOUNT/etc/fstab" || fail 'fstab root entry is invalid'
+    grep -Eq '^[[:space:]]*(UUID=|PARTUUID=)[^[:space:]]+[[:space:]]+/boot/efi[[:space:]]+vfat([[:space:]]|$)' "$ROOT_MOUNT/etc/fstab" || fail 'fstab EFI entry is invalid'
+    arch-chroot "$ROOT_MOUNT" findmnt --verify --tab-file /etc/fstab >/dev/null || fail 'fstab verification failed'
+    if grep -Eq '^[[:space:]]*/dev/(sd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme[0-9]+n[0-9]+p?[0-9]*)[[:space:]]' "$ROOT_MOUNT/etc/fstab"; then fail 'fstab contains an unstable device path'; fi
+    printf 'OK\n'
+
+    step=$((step + 1)); printf '[%d/8] Kernel/initramfs ........... ' "$step"
+    [[ -s "$ROOT_MOUNT/boot/vmlinuz-linux" && -s "$ROOT_MOUNT/boot/initramfs-linux.img" ]] || fail 'root kernel or initramfs is missing'
+    [[ -s "$ROOT_MOUNT/boot/efi/vmlinuz-linux" && -s "$ROOT_MOUNT/boot/efi/initramfs-linux.img" ]] || fail 'ESP kernel or initramfs copy is missing'
+    printf 'OK\n'
+
+    step=$((step + 1)); printf '[%d/8] systemd-boot ............... ' "$step"
+    [[ -s "$ROOT_MOUNT/boot/efi/loader/loader.conf" && -s "$ROOT_MOUNT/boot/efi/loader/entries/kiyarch.conf" ]] || fail 'systemd-boot loader files are missing'
+    grep -Eq '^default[[:space:]]+kiyarch\.conf$' "$ROOT_MOUNT/boot/efi/loader/loader.conf" || fail 'loader.conf selects the wrong entry'
+    grep -Eq '^linux[[:space:]]+/vmlinuz-linux$' "$ROOT_MOUNT/boot/efi/loader/entries/kiyarch.conf" || fail 'loader entry kernel path is invalid'
+    grep -Eq '^initrd[[:space:]]+/initramfs-linux\.img$' "$ROOT_MOUNT/boot/efi/loader/entries/kiyarch.conf" || fail 'loader entry initramfs path is invalid'
+    while read -r _ initrd_path; do
+        [[ -s "$ROOT_MOUNT/boot/efi${initrd_path}" ]] || fail "loader entry initrd is missing: $initrd_path"
+    done < <(awk '$1 == "initrd" { print $1, $2 }' "$ROOT_MOUNT/boot/efi/loader/entries/kiyarch.conf")
+    grep -Eq "^options[[:space:]]+root=UUID=$(blkid -s UUID -o value "$ROOT_PART")[[:space:]]+rw$" "$ROOT_MOUNT/boot/efi/loader/entries/kiyarch.conf" || fail 'loader entry root UUID is invalid'
+    bootctl --no-pager --root="$ROOT_MOUNT" --esp-path=/boot/efi status >/tmp/kiyarch-bootctl-status || fail 'bootctl could not validate the installed systemd-boot state'
+    grep -Eiq 'systemd-boot|product:' /tmp/kiyarch-bootctl-status || fail 'bootctl validation output was unexpected'
+    printf 'OK\n'
+
+    step=$((step + 1)); printf '[%d/8] User/sudo configuration .... ' "$step"
+    arch-chroot "$ROOT_MOUNT" id "$USER_NAME" >/dev/null || fail 'installed user does not exist'
+    [[ -x "$ROOT_MOUNT/usr/bin/$USER_SHELL" && -d "$ROOT_MOUNT/home/$USER_NAME" ]] || fail 'user shell or home directory is missing'
+    [[ "$(stat -c '%U:%G' "$ROOT_MOUNT/home/$USER_NAME")" == "$USER_NAME:$USER_NAME" ]] || fail 'user home ownership is incorrect'
+    sudo_file="/etc/sudoers.d/10-kiyarch-$USER_NAME"
+    [[ -s "$ROOT_MOUNT$sudo_file" ]] || fail 'sudo policy is missing'
+    arch-chroot "$ROOT_MOUNT" visudo -c -f "$sudo_file" >/dev/null || fail 'sudo policy failed visudo validation'
+    root_lock="$(arch-chroot "$ROOT_MOUNT" awk -F: '$1 == "root" { print $2 }' /etc/shadow)"; [[ "$root_lock" == '!'* || "$root_lock" == '*'* ]] || fail 'root password is not locked'
+    printf 'OK\n'
+
+    step=$((step + 1)); printf '[%d/8] Profile services ........... ' "$step"
+    mapfile -t PROFILE_SERVICES < <(kiyarch_profile_array "$PROFILE_APPLY_ID" services)
+    for service in "${PROFILE_SERVICES[@]}"; do
+        enabled="$(arch-chroot "$ROOT_MOUNT" systemctl is-enabled "$service" 2>/dev/null || true)"
+        [[ "$enabled" == enabled ]] || fail "profile service is not enabled: $service"
+    done
+    printf 'OK\n'
+
+    step=$((step + 1)); printf '[%d/8] Locale/network ............. ' "$step"
+    grep -Eq "^[[:space:]]*${LOCALE//./\\.}[[:space:]]+UTF-8[[:space:]]*$" "$ROOT_MOUNT/etc/locale.gen" || fail 'requested locale is not enabled'
+    [[ "$(cat "$ROOT_MOUNT/etc/locale.conf")" == "$LOCALE" && "$(cat "$ROOT_MOUNT/etc/hostname")" == "$HOSTNAME_VALUE" ]] || fail 'locale or hostname validation failed'
+    grep -Eq "^KEYMAP=${KEYBOARD}$" "$ROOT_MOUNT/etc/vconsole.conf" || fail 'keyboard layout validation failed'
+    locale_expected="$(printf '%s' "$LOCALE" | tr '[:upper:]' '[:lower:]' | tr -d '.-')"
+    locale_value="$(arch-chroot "$ROOT_MOUNT" locale -a 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '.-' | grep -Fx "$locale_expected" | head -n1 || true)"
+    [[ -n "$locale_value" ]] || fail 'requested locale was not generated'
+    enabled="$(arch-chroot "$ROOT_MOUNT" systemctl is-enabled NetworkManager.service 2>/dev/null || true)"; [[ "$enabled" == enabled ]] || fail 'NetworkManager is not enabled'
+    printf 'OK\n'
+
+    if grep -Eq '"caelestia_source"[[:space:]]*:[[:space:]]*\{' "$PLAN_PATH"; then
+        commit="$(cat "$ROOT_MOUNT/opt/caelestia-shell/KIYARCH_COMMIT" 2>/dev/null || true)"
+        [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail 'Caelestia commit marker is missing'
+        grep -q 'qs -c caelestia' "$ROOT_MOUNT/etc/skel/.config/hypr/hyprland.conf" || fail 'Caelestia startup command is missing'
+    fi
+    printf '\nKiyArch installation verified successfully.\n'
+}
+
+write_report() {
+    local report="$ROOT_MOUNT/var/log/kiyarch-install-report.txt"
+    mkdir -p "$(dirname "$report")"
+    {
+        printf 'KiyArch installation complete\nProfile: %s\nTarget: %s\nHostname: %s\n' "$PROFILE_ID" "$TARGET" "$HOSTNAME_VALUE"
+        printf 'Layout: GPT, 1 GiB FAT32 EFI, remaining ext4 root, no swap\nNetwork: NetworkManager\nRoot password: locked\n'
+        printf 'UEFI NVRAM: %s\n' "$NVRAM_STATUS"
+        [[ "$PROFILE_ID" == hyprland-caelestia ]] && printf 'Caelestia commit: %s\n' "$(cat "$ROOT_MOUNT/opt/caelestia-shell/KIYARCH_COMMIT")"
+        printf 'Reboot instruction: umount -R /mnt; reboot\n'
+    } > "$report"
+    cp "$LOG_PATH" "$report.execution.log" 2>/dev/null || true
+    cp "$report" /run/kiyarch/install-report.txt 2>/dev/null || true
+}
+
+main() {
+    mkdir -p /run/kiyarch
+    exec > >(tee -a "$LOG_PATH") 2>&1
+    validate_plan
+    read_plan_packages
+    source_preflight
+    recollect_target
+    confirm_target
+    if [[ "$DRY_RUN" == true ]]; then
+        printf '%bDry run passed:%b no partition, format, mount, package, or account operation was performed.\n' "$GREEN" "$RESET"
+        exit 0
+    fi
+    collect_credentials_input
+    partition_devices
+    mkdir -p "$ROOT_MOUNT"
+    trap 'umount -R "$ROOT_MOUNT" 2>/dev/null || true' EXIT
+    install_filesystems
+    install_system
+    collect_credentials
+    post_validate
+    write_report
+    trap - EXIT
+    umount -R "$ROOT_MOUNT"
+    printf '%bInstallation complete.%b Report: /mnt/var/log/kiyarch-install-report.txt (on the installed system)\nReboot after unmounting the live target.\n' "$GREEN" "$RESET"
+}
+
+main "$@"

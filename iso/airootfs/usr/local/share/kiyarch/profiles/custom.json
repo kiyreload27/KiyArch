@@ -1,0 +1,14 @@
+{
+  "id": "custom",
+  "display_name": "Custom",
+  "description": "Choose a base profile and curated hardware/session components.",
+  "manifest_version": "1",
+  "manifest_hash": "sha256:00d77a35934b10bd6ffb1021196a8e3ee8d3ee81e04a83fc4c21fcc2bba9839a",
+  "required_components": [],
+  "optional_components": ["ssh", "graphical-session", "laptop-features", "desktop-features"],
+  "packages": [],
+  "services": [],
+  "configuration_templates": ["locale", "keyboard", "timezone", "hostname", "sudoers"],
+  "graphical_session": false,
+  "caelestia_source": null
+}

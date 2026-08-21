@@ -1,0 +1,14 @@
+{
+  "id": "minimal",
+  "display_name": "Minimal",
+  "description": "Terminal-first Arch system with networking and administration tools.",
+  "manifest_version": "1",
+  "manifest_hash": "sha256:fb17aedc3a689e496a1cc3e6442f676208939362dcd71d59280978aec3c0f723",
+  "required_components": ["base-system", "networkmanager", "sudo", "documentation"],
+  "optional_components": ["ssh"],
+  "packages": ["base", "linux", "linux-firmware", "sudo", "networkmanager", "man-db", "man-pages", "less", "vim", "zsh"],
+  "services": ["NetworkManager.service"],
+  "configuration_templates": ["locale", "keyboard", "timezone", "hostname", "sudoers"],
+  "graphical_session": false,
+  "caelestia_source": null
+}

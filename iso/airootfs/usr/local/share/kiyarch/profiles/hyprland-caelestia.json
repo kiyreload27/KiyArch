@@ -1,0 +1,14 @@
+{
+  "id": "hyprland-caelestia",
+  "display_name": "Hyprland + Caelestia",
+  "description": "Desktop profile with Hyprland and a source-pinned Caelestia shell.",
+  "manifest_version": "1",
+  "manifest_hash": "sha256:7ace2ec59bdc06ca843e7ecddd278758f9551e6303a563e4448dce06c835d25c",
+  "required_components": ["base-system", "networkmanager", "audio", "graphics", "portals", "polkit", "fonts", "hyprland", "caelestia-shell"],
+  "optional_components": ["ssh"],
+  "packages": ["base", "linux", "linux-firmware", "sudo", "networkmanager", "man-db", "man-pages", "less", "vim", "zsh", "pipewire", "pipewire-pulse", "wireplumber", "mesa", "wayland", "xorg-xwayland", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "polkit", "fontconfig", "ttf-dejavu", "greetd", "tuigreet", "hyprland", "hyprpaper", "grim", "slurp", "mako", "quickshell", "git", "cmake", "ninja", "qt6-base", "qt6-declarative", "qt6-imageformats", "qt6-shadertools", "ddcutil", "libcava", "lm_sensors", "aubio", "libqalculate", "swappy", "fish", "ttf-material-symbols-variable", "ttf-rubik-vf", "ttf-cascadia-code-nerd"],
+  "services": ["NetworkManager.service", "greetd.service"],
+  "configuration_templates": ["locale", "keyboard", "timezone", "hostname", "sudoers", "audio", "greetd", "hyprland", "caelestia"],
+  "graphical_session": true,
+  "caelestia_source": {"repository": "https://github.com/caelestia-dots/shell", "commit": "e04a9d3fd8b24e106f0972204dd8e7683ac017a8"}
+}

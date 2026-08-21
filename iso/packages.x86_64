@@ -131,3 +131,7 @@ xfsprogs
 xl2tpd
 zsh
 rfkill
+networkmanager
+git
+cmake
+ninja

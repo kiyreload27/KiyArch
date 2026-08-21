@@ -32,9 +32,35 @@ for required in \
     "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants/sshd.service" \
     "$BIN_DIR/kiyarch-help" \
     "$BIN_DIR/kiyarch-hw" \
-    "$BIN_DIR/kiyarch-ssh"; do
+    "$BIN_DIR/kiyarch-install" \
+    "$BIN_DIR/kiyarch-execute" \
+    "$BIN_DIR/kiyarch-plan" \
+    "$BIN_DIR/kiyarch-ssh" \
+    "$BIN_DIR/kiyarch-menu" \
+    "$BIN_DIR/kiyarch-network" \
+    "$BIN_DIR/kiyarch-diagnose" \
+    "$PROFILE_DIR/airootfs/usr/local/lib/kiyarch-hardware.sh" \
+    "$PROFILE_DIR/airootfs/usr/local/lib/kiyarch-profiles.sh" \
+    "$PROFILE_DIR/airootfs/root/.bash_profile" \
+    "$PROFILE_DIR/airootfs/root/.zprofile"; do
     check_file "$required"
 done
+
+if ! grep -Fq 'exec /usr/local/bin/kiyarch-menu' "$PROFILE_DIR/airootfs/root/.zprofile"; then
+    error "zsh login profile does not hand tty1 to kiyarch-menu"
+fi
+if ! grep -Fq 'SSH_CONNECTION' "$PROFILE_DIR/airootfs/root/.zprofile" || ! grep -Fq 'SSH_TTY' "$PROFILE_DIR/airootfs/root/.zprofile"; then
+    error "zsh login profile lacks SSH exclusions"
+fi
+if ! grep -Fq 'tty 2>/dev/null' "$PROFILE_DIR/airootfs/root/.zprofile"; then
+    error "zsh login profile does not restrict the menu to a terminal"
+fi
+if ! grep -Fq '["/root/.zprofile"]="0:0:644"' "$PROFILE_FILE"; then
+    error "zsh login profile has no explicit ISO ownership/permission entry"
+fi
+if ! grep -Eq '^root:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:/usr/bin/zsh$' "$PROFILE_DIR/airootfs/etc/passwd"; then
+    error "live root shell is no longer the expected zsh shell"
+fi
 
 if [[ -L "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants/sshd.service" ]]; then
     [[ "$(readlink "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants/sshd.service")" == /usr/lib/systemd/system/sshd.service ]] || \
@@ -43,10 +69,22 @@ else
     error "sshd.service enablement entry is not a symlink"
 fi
 
-for package in inetutils pciutils dmidecode openssh rfkill; do
+for package in inetutils pciutils dmidecode openssh rfkill networkmanager git cmake ninja; do
     if ! awk -v wanted="$package" '$1 == wanted { found=1 } END { exit !found }' "$PACKAGES_FILE"; then
         error "required package is missing from packages.x86_64: $package"
     fi
+done
+
+mapfile -t profile_manifests < <(find "$PROFILE_DIR/airootfs/usr/local/share/kiyarch/profiles" -maxdepth 1 -type f -name '*.json' | sort)
+if ((${#profile_manifests[@]} != 5)); then
+    error "expected five profile manifests, found ${#profile_manifests[@]}"
+fi
+for manifest in "${profile_manifests[@]}"; do
+    for field in id display_name description manifest_version manifest_hash required_components optional_components packages services configuration_templates graphical_session; do
+        grep -Eq "^[[:space:]]*\"$field\"[[:space:]]*:" "$manifest" || error "profile manifest lacks $field: ${manifest##*/}"
+    done
+    grep -Eq '"manifest_version"[[:space:]]*:[[:space:]]*"1"' "$manifest" || error "profile manifest version is not 1: ${manifest##*/}"
+    grep -Eq '"manifest_hash"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' "$manifest" || error "profile manifest hash is invalid: ${manifest##*/}"
 done
 
 mapfile -t duplicate_packages < <(awk 'NF && $1 !~ /^#/ { print $1 }' "$PACKAGES_FILE" | sort | uniq -d)
