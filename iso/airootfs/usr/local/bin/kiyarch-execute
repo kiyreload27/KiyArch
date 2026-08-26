@@ -22,6 +22,7 @@ RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; RESET='\033[0m'
 PLAN_PATH=""; DRY_RUN=false; TARGET=""; TARGET_INDEX=-1; PROFILE_ID=""; PROFILE_APPLY_ID=""; USER_NAME=""; USER_SHELL="zsh"
 LOCALE=""; KEYBOARD=""; TIMEZONE=""; HOSTNAME_VALUE=""; GRAPHICAL=false; PACKAGE_STATUS=""; NVRAM_STATUS="unknown"; ROOT_MOUNT=/mnt
 LOG_PATH=/run/kiyarch/install-execution.log
+MIN_DISK_SIZE_BYTES=17179869184
 
 usage() {
     cat <<'USAGE'
@@ -92,6 +93,40 @@ read_plan_packages() {
     kiyarch_validate_package_list "${REQUESTED_PACKAGES[@]}" || fail 'plan contains an invalid package name'
 }
 
+package_requested() {
+    local wanted="$1" package
+    for package in "${REQUESTED_PACKAGES[@]}"; do
+        [[ "$package" == "$wanted" ]] && return 0
+    done
+    return 1
+}
+
+add_effective_service() {
+    local service="$1" existing
+    [[ "$service" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || fail "invalid effective service: $service"
+    for existing in "${EFFECTIVE_SERVICES[@]}"; do
+        [[ "$existing" == "$service" ]] && return 0
+    done
+    EFFECTIVE_SERVICES+=("$service")
+}
+
+build_effective_services() {
+    local service
+    EFFECTIVE_SERVICES=()
+    mapfile -t PROFILE_SERVICES < <(kiyarch_profile_array "$PROFILE_APPLY_ID" services)
+    for service in "${PROFILE_SERVICES[@]}"; do
+        # Custom profiles can turn off the graphical session inherited from a
+        # graphical base, so do not enable a display manager in that case.
+        [[ "$service" == greetd.service && "$GRAPHICAL" != true ]] && continue
+        add_effective_service "$service"
+    done
+    [[ "$GRAPHICAL" == true ]] && add_effective_service greetd.service
+    package_requested openssh && add_effective_service sshd.service
+    package_requested bluez && add_effective_service bluetooth.service
+    package_requested power-profiles-daemon && add_effective_service power-profiles-daemon.service
+    ((${#EFFECTIVE_SERVICES[@]})) || fail 'selected profile declares no effective services'
+}
+
 source_preflight() {
     local package repo commit
     have pacman || fail 'pacman is unavailable'
@@ -101,15 +136,17 @@ source_preflight() {
     for package in "${REQUESTED_PACKAGES[@]}"; do
         pacman -Sp --noconfirm --needed --print-format '%n' "$package" >/dev/null 2>&1 || fail "package unavailable in official Arch repositories: $package"
     done
-    printf '  staging verified packages before any disk changes...\n'
-    pacman -Sw --noconfirm --needed --disable-download-timeout "${REQUESTED_PACKAGES[@]}" || fail 'package download preflight failed; no disk changes were made'
-    printf 'Package download preflight passed.\n'
+    # Do not download the package set into the live root here. The live
+    # overlay can be small even when the target disk is large; staging a
+    # graphical package set there can fill / before installation starts.
+    # pacstrap downloads directly into the mounted target filesystem below.
+    printf 'Package availability preflight passed; packages will be downloaded into the target filesystem after formatting.\n'
     if grep -Eq '"caelestia_source"[[:space:]]*:[[:space:]]*\{' "$PLAN_PATH"; then
         repo='https://github.com/caelestia-dots/shell'
         commit="$(sed -nE 's/.*"commit"[[:space:]]*:[[:space:]]*"([0-9a-f]{40})".*/\1/p' "$PLAN_PATH" | head -n1)"
         [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail 'Caelestia commit is not immutable'
         have git || fail 'git is unavailable for Caelestia source verification'
-        git ls-remote "$repo" "$commit^{commit}" | awk -v commit="$commit" '$1 == commit { found=1 } END { exit !found }' || fail 'pinned Caelestia source commit is unavailable'
+        git ls-remote "$repo" | awk -v commit="$commit" '$1 == commit { found=1 } END { exit !found }' || fail 'pinned Caelestia source commit is not advertised upstream'
     fi
 }
 
@@ -124,6 +161,7 @@ recollect_target() {
     planned_wwn="$(sed -nE 's/.*"target_disk"[[:space:]]*:[[:space:]]*\{[^}]*"wwn"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$PLAN_PATH" | head -n1)"
     planned_pttype="$(sed -nE 's/.*"target_disk"[[:space:]]*:[[:space:]]*\{[^}]*"current_partition_table"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$PLAN_PATH" | head -n1)"
     [[ "$planned_device" == /dev/* && "$planned_size" =~ ^[0-9]+$ ]] || fail 'target disk identity is incomplete'
+    ((planned_size >= MIN_DISK_SIZE_BYTES)) || fail 'target disk is smaller than the 16 GiB installation minimum'
     kiyarch_collect_platform; [[ "$KIYARCH_FIRMWARE" == uefi ]] || fail 'legacy BIOS cannot be installed by this executor'
     kiyarch_collect_storage
     for ((index=0; index<${#STORAGE_DEVICE[@]}; index++)); do
@@ -185,10 +223,8 @@ install_filesystems() {
 
 enable_profile_services() {
     local service
-    mapfile -t PROFILE_SERVICES < <(kiyarch_profile_array "$PROFILE_APPLY_ID" services)
-    ((${#PROFILE_SERVICES[@]})) || fail 'selected profile declares no services'
-    for service in "${PROFILE_SERVICES[@]}"; do
-        [[ "$service" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || fail "invalid service in profile manifest: $service"
+    build_effective_services
+    for service in "${EFFECTIVE_SERVICES[@]}"; do
         arch-chroot "$ROOT_MOUNT" systemctl enable "$service"
     done
 }
@@ -211,7 +247,9 @@ ensure_esp_mounted() {
 install_system() {
     local packages_string package
     packages_string="${REQUESTED_PACKAGES[*]}"
-    pacstrap -K -c "$ROOT_MOUNT" $packages_string
+    # Without -c, pacstrap uses the target filesystem's package cache. This
+    # avoids filling the live ISO root with the package download set.
+    pacstrap -K "$ROOT_MOUNT" $packages_string
     [[ -d "$ROOT_MOUNT/etc" && -d "$ROOT_MOUNT/usr" ]] || fail 'pacstrap did not create the Arch filesystem tree'
     [[ -x "$ROOT_MOUNT/usr/lib/systemd/systemd" || -x "$ROOT_MOUNT/usr/bin/systemd" || -x "$ROOT_MOUNT/usr/bin/init" ]] || fail 'pacstrap did not install a usable systemd/init executable'
     [[ -s "$ROOT_MOUNT/boot/vmlinuz-linux" ]] || fail 'pacstrap did not install the Linux kernel'
@@ -226,6 +264,12 @@ install_system() {
     arch-chroot "$ROOT_MOUNT" hwclock --systohc
     arch-chroot "$ROOT_MOUNT" sed -i "s/^#\($LOCALE[[:space:]]*UTF-8\)/\1/" /etc/locale.gen
     arch-chroot "$ROOT_MOUNT" locale-gen
+    # Seed a harmless zsh startup file so the first login does not stop at
+    # zsh-newuser-install and appear to be an installation failure.
+    if [[ "$USER_SHELL" == zsh ]]; then
+        mkdir -p "$ROOT_MOUNT/etc/skel"
+        printf '# KiyArch zsh user configuration\n' > "$ROOT_MOUNT/etc/skel/.zshrc"
+    fi
     arch-chroot "$ROOT_MOUNT" useradd -m -U -G wheel -s "/usr/bin/$USER_SHELL" "$USER_NAME"
     printf '%s ALL=(ALL:ALL) ALL\n' "$USER_NAME" > "$ROOT_MOUNT/etc/sudoers.d/10-kiyarch-$USER_NAME"
     chmod 0440 "$ROOT_MOUNT/etc/sudoers.d/10-kiyarch-$USER_NAME"
@@ -234,10 +278,9 @@ install_system() {
     arch-chroot "$ROOT_MOUNT" mkinitcpio -P
     configure_boot
     configure_session
-    if [[ -f "$ROOT_MOUNT/etc/skel/.config/hypr/hyprland.conf" ]]; then
-        mkdir -p "$ROOT_MOUNT/home/$USER_NAME/.config/hypr"
-        cp "$ROOT_MOUNT/etc/skel/.config/hypr/hyprland.conf" "$ROOT_MOUNT/home/$USER_NAME/.config/hypr/hyprland.conf"
-        arch-chroot "$ROOT_MOUNT" chown -R "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.config"
+    if [[ "$GRAPHICAL" == true && -d "$ROOT_MOUNT/etc/skel" ]]; then
+        cp -a "$ROOT_MOUNT/etc/skel/." "$ROOT_MOUNT/home/$USER_NAME/"
+        arch-chroot "$ROOT_MOUNT" chown -R "$USER_NAME:$USER_NAME" "/home/$USER_NAME"
     fi
 }
 
@@ -279,16 +322,31 @@ configure_boot() {
 }
 
 configure_session() {
+    local brand_dir commit
     [[ "$GRAPHICAL" == true ]] || return 0
-    mkdir -p "$ROOT_MOUNT/etc/greetd" "$ROOT_MOUNT/etc/skel/.config/hypr"
+    brand_dir=/usr/local/share/kiyarch/midnight-forge
+    [[ -d "$brand_dir" ]] || brand_dir="$SCRIPT_DIR/../share/kiyarch/midnight-forge"
+    [[ -d "$brand_dir" ]] || fail 'Midnight Forge desktop assets are unavailable'
+
+    mkdir -p "$ROOT_MOUNT/etc/greetd" \
+        "$ROOT_MOUNT/etc/skel/.config/hypr" \
+        "$ROOT_MOUNT/etc/skel/.config/kitty" \
+        "$ROOT_MOUNT/etc/skel/.config/fuzzel" \
+        "$ROOT_MOUNT/etc/skel/.config/caelestia" \
+        "$ROOT_MOUNT/etc/skel/Pictures/Wallpapers"
     printf '[terminal]\nvt = 1\n\n[default_session]\ncommand = "tuigreet --cmd Hyprland"\nuser = "greeter"\n' > "$ROOT_MOUNT/etc/greetd/config.toml"
     : > "$ROOT_MOUNT/etc/skel/.config/hypr/hyprland.conf"
     if grep -Eq '"caelestia_source"[[:space:]]*:[[:space:]]*\{' "$PLAN_PATH"; then
-        printf 'exec-once = qs -c caelestia -n -d\n' > "$ROOT_MOUNT/etc/skel/.config/hypr/hyprland.conf"
+        cp "$brand_dir/hypr/hyprland.conf" "$ROOT_MOUNT/etc/skel/.config/hypr/hyprland.conf"
+        cp "$brand_dir/hypr/hyprpaper.conf" "$ROOT_MOUNT/etc/skel/.config/hypr/hyprpaper.conf"
+        cp "$brand_dir/kitty/kitty.conf" "$ROOT_MOUNT/etc/skel/.config/kitty/kitty.conf"
+        cp "$brand_dir/fuzzel/fuzzel.ini" "$ROOT_MOUNT/etc/skel/.config/fuzzel/fuzzel.ini"
+        cp "$brand_dir/caelestia/shell.json" "$ROOT_MOUNT/etc/skel/.config/caelestia/shell.json"
+        cp "$brand_dir/wallpaper.png" "$ROOT_MOUNT/etc/skel/Pictures/Wallpapers/midnight-forge.png"
         have git && have cmake && have ninja || fail 'Caelestia build tools are unavailable'
         mkdir -p "$ROOT_MOUNT/opt"
         git clone 'https://github.com/caelestia-dots/shell' "$ROOT_MOUNT/opt/caelestia-shell"
-        local commit; commit="$(sed -nE 's/.*"commit"[[:space:]]*:[[:space:]]*"([0-9a-f]{40})".*/\1/p' "$PLAN_PATH" | head -n1)"
+        commit="$(sed -nE 's/.*"commit"[[:space:]]*:[[:space:]]*"([0-9a-f]{40})".*/\1/p' "$PLAN_PATH" | head -n1)"
         git -C "$ROOT_MOUNT/opt/caelestia-shell" checkout --detach "$commit"
         arch-chroot "$ROOT_MOUNT" cmake -S /opt/caelestia-shell -B /opt/caelestia-shell/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/
         arch-chroot "$ROOT_MOUNT" cmake --build /opt/caelestia-shell/build
@@ -357,7 +415,14 @@ post_validate() {
     step=$((step + 1)); printf '[%d/8] User/sudo configuration .... ' "$step"
     arch-chroot "$ROOT_MOUNT" id "$USER_NAME" >/dev/null || fail 'installed user does not exist'
     [[ -x "$ROOT_MOUNT/usr/bin/$USER_SHELL" && -d "$ROOT_MOUNT/home/$USER_NAME" ]] || fail 'user shell or home directory is missing'
-    [[ "$(stat -c '%U:%G' "$ROOT_MOUNT/home/$USER_NAME")" == "$USER_NAME:$USER_NAME" ]] || fail 'user home ownership is incorrect'
+    # Resolve names from the installed root, not the live ISO's passwd/group
+    # databases. The live environment normally does not know the new user,
+    # so stat's %U:%G would report numeric/unknown names and reject valid
+    # ownership.
+    local home_uid home_gid
+    home_uid="$(arch-chroot "$ROOT_MOUNT" id -u "$USER_NAME")"
+    home_gid="$(arch-chroot "$ROOT_MOUNT" id -g "$USER_NAME")"
+    [[ "$(stat -c '%u:%g' "$ROOT_MOUNT/home/$USER_NAME")" == "$home_uid:$home_gid" ]] || fail 'user home ownership is incorrect'
     sudo_file="/etc/sudoers.d/10-kiyarch-$USER_NAME"
     [[ -s "$ROOT_MOUNT$sudo_file" ]] || fail 'sudo policy is missing'
     arch-chroot "$ROOT_MOUNT" visudo -c -f "$sudo_file" >/dev/null || fail 'sudo policy failed visudo validation'
@@ -365,8 +430,8 @@ post_validate() {
     printf 'OK\n'
 
     step=$((step + 1)); printf '[%d/8] Profile services ........... ' "$step"
-    mapfile -t PROFILE_SERVICES < <(kiyarch_profile_array "$PROFILE_APPLY_ID" services)
-    for service in "${PROFILE_SERVICES[@]}"; do
+    build_effective_services
+    for service in "${EFFECTIVE_SERVICES[@]}"; do
         enabled="$(arch-chroot "$ROOT_MOUNT" systemctl is-enabled "$service" 2>/dev/null || true)"
         [[ "$enabled" == enabled ]] || fail "profile service is not enabled: $service"
     done

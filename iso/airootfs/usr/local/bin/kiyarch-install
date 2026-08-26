@@ -4,8 +4,17 @@
 # This command intentionally has no installation executor.
 set -u
 
-BOLD="\033[1m"; CYAN="\033[36m"; YELLOW="\033[33m"; GREEN="\033[32m"; RED="\033[31m"; RESET="\033[0m"
+BOLD="\033[1m"; CYAN="\033[33m"; YELLOW="\033[33m"; GREEN="\033[32m"; RED="\033[31m"; RESET="\033[0m"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for UI_LIB in /usr/local/lib/kiyarch-ui.sh "$SCRIPT_DIR/../lib/kiyarch-ui.sh"; do
+    if [[ -r "$UI_LIB" ]]; then
+        # shellcheck source=../lib/kiyarch-ui.sh
+        source "$UI_LIB"
+        BOLD="$KIY_UI_BOLD"; CYAN="$KIY_UI_EMBER"; YELLOW="$KIY_UI_EMBER"
+        GREEN="$KIY_UI_OK"; RED="$KIY_UI_FAIL"; RESET="$KIY_UI_RESET"
+        break
+    fi
+done
 for HARDWARE_LIB in /usr/local/lib/kiyarch-hardware.sh "$SCRIPT_DIR/../lib/kiyarch-hardware.sh"; do
     [[ -r "$HARDWARE_LIB" ]] && source "$HARDWARE_LIB" && break
 done
@@ -24,6 +33,10 @@ PLAN_VALIDATOR=/usr/local/bin/kiyarch-plan
 [[ -x "$PLAN_VALIDATOR" ]] || PLAN_VALIDATOR="$SCRIPT_DIR/kiyarch-plan"
 
 EFI_SIZE_BYTES=1073741824
+# The live package cache and the base system already exceed 2 GiB. Reject
+# tiny targets before planning so the install cannot erase a disk and fail for
+# lack of root space halfway through installation.
+MIN_DISK_SIZE_BYTES=17179869184
 DEFAULT_EXPORT_PATH=/run/kiyarch/install-plan.json
 EXPORT_PATH=""
 ADMIN_USER=""
@@ -75,8 +88,8 @@ done
 
 section() {
     local title="$1"
-    printf '\n%b%s%b\n' "$BOLD$CYAN" "$title" "$RESET"
-    printf '%*s\n' "${#title}" '' | tr ' ' '-'
+    printf '\n%b-- %s %b' "$BOLD$CYAN" "${title^^}" "$RESET"
+    printf '%*s\n' "$((48 - ${#title} > 1 ? 48 - ${#title} : 1))" '' | tr ' ' '-'
 }
 
 item() { printf '  %-22s %s\n' "$1" "$2"; }
@@ -168,11 +181,16 @@ build_package_list() {
     [[ "$SSH_REQUESTED" == true ]] && REQUESTED_PACKAGES+=(openssh)
     [[ "$LAPTOP_FEATURES" == true ]] && REQUESTED_PACKAGES+=(bluez bluez-utils power-profiles-daemon brightnessctl libinput)
     [[ "$DESKTOP_FEATURES" == true ]] && REQUESTED_PACKAGES+=(mesa wayland xorg-xwayland xdg-desktop-portal xdg-desktop-portal-gtk polkit)
-    [[ "$PROFILE_ID" == custom && "$GRAPHICAL_REQUESTED" == true ]] && REQUESTED_PACKAGES+=(greetd tuigreet hyprland wayland xorg-xwayland xdg-desktop-portal xdg-desktop-portal-gtk polkit)
+    [[ "$PROFILE_ID" == custom && "$GRAPHICAL_REQUESTED" == true ]] && REQUESTED_PACKAGES+=(greetd greetd-tuigreet hyprland wayland xorg-xwayland xdg-desktop-portal xdg-desktop-portal-gtk polkit)
     if [[ "$PROFILE_ID" == custom && "$GRAPHICAL_REQUESTED" == false ]]; then
-        REQUESTED_PACKAGES=($(printf '%s\n' "${REQUESTED_PACKAGES[@]}" | grep -Ev '^(greetd|tuigreet|hyprland|hyprpaper|grim|slurp|mako|quickshell|qt5-wayland|qt6-wayland|gtk3|gtk4|git|cmake|ninja|qt6-base|qt6-declarative|qt6-imageformats|qt6-shadertools|ddcutil|libcava|lm_sensors|aubio|libqalculate|swappy|fish|ttf-material-symbols-variable|ttf-rubik-vf|ttf-cascadia-code-nerd)$' || true))
+        REQUESTED_PACKAGES=($(printf '%s\n' "${REQUESTED_PACKAGES[@]}" | grep -Ev '^(greetd|greetd-tuigreet|hyprland|hyprpaper|kitty|fuzzel|grim|slurp|mako|quickshell|qt5-wayland|qt6-wayland|gtk3|gtk4|git|cmake|ninja|gcc|qt6-base|qt6-declarative|qt6-imageformats|qt6-shadertools|ddcutil|cava|lm_sensors|aubio|libqalculate|swappy|fish|ttf-material-symbols-variable|inter-font|ttf-cascadia-code-nerd)$' || true))
     fi
     [[ "$MICROCODE_PACKAGE" != none ]] && REQUESTED_PACKAGES+=("$MICROCODE_PACKAGE")
+    # bash is part of the base profile and zsh is present in every curated
+    # profile. fish is optional, so include it when the user selects it as the
+    # installed account's shell instead of creating a user with a missing
+    # login shell.
+    [[ "$USER_SHELL" == fish ]] && REQUESTED_PACKAGES+=(fish)
     REQUESTED_PACKAGES+=("${ADDITIONAL_PACKAGES[@]}")
     mapfile -t REQUESTED_PACKAGES < <(printf '%s\n' "${REQUESTED_PACKAGES[@]}" | kiyarch_unique_packages)
     kiyarch_validate_package_list "${REQUESTED_PACKAGES[@]}" || fail 'requested package list contains an invalid package name'
@@ -200,7 +218,7 @@ package_preflight() {
     if [[ -n "$repo" || -n "$commit" ]]; then
         [[ -n "$repo" && "$commit" =~ ^[0-9a-f]{40}$ ]] || fail 'Caelestia source is not pinned to a full immutable commit'
         command -v git >/dev/null 2>&1 || fail 'git is unavailable for the pinned Caelestia source'
-        git ls-remote "$repo" "$commit^{commit}" | awk -v commit="$commit" '$1 == commit { found=1 } END { exit !found }' || fail "pinned Caelestia commit cannot be fetched: $commit"
+        git ls-remote "$repo" | awk -v commit="$commit" '$1 == commit { found=1 } END { exit !found }' || fail "pinned Caelestia commit is not advertised by the upstream repository: $commit"
     fi
     RESOLVED_PACKAGE_STATUS=verified
     printf 'Package and source preflight passed.\n'
@@ -266,7 +284,7 @@ select_disk() {
             none|gpt) ;;
             *) printf '%bThe selected disk has unsupported or ambiguous partition-table metadata (%s).%b\n' "$RED" "${STORAGE_PTTYPE[$SELECTED_INDEX]}" "$RESET"; continue ;;
         esac
-        ((STORAGE_SIZE_BYTES[SELECTED_INDEX] > EFI_SIZE_BYTES)) || { printf '%bThe selected disk is too small for a 1 GiB EFI partition and a root partition.%b\n' "$RED" "$RESET"; continue; }
+        ((STORAGE_SIZE_BYTES[SELECTED_INDEX] >= MIN_DISK_SIZE_BYTES)) || { printf '%bThe selected disk is too small; KiyArch requires at least 16 GiB for this installation milestone.%b\n' "$RED" "$RESET"; continue; }
         break
     done
 }
@@ -424,6 +442,11 @@ if [[ "${KIYARCH_INSTALL_LIBRARY_ONLY:-0}" == 1 ]]; then
     return 0 2>/dev/null || exit 0
 fi
 
+clear 2>/dev/null || true
+if declare -F kiyarch_ui_banner >/dev/null; then
+    kiyarch_ui_banner
+    printf '%bGUIDED INSTALLATION%b\n' "${KIY_UI_DIM:-}" "$RESET"
+fi
 kiyarch_collect_platform
 CPU_VENDOR_ID="$(awk -F: '/^vendor_id[[:space:]]*:/ {gsub(/^[[:space:]]+/,"",$2);print $2;exit}' /proc/cpuinfo 2>/dev/null)"
 case "$CPU_VENDOR_ID" in GenuineIntel) MICROCODE_PACKAGE=intel-ucode;; AuthenticAMD) MICROCODE_PACKAGE=amd-ucode;; esac

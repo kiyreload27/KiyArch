@@ -3,12 +3,12 @@
   "display_name": "Hyprland + Caelestia",
   "description": "Desktop profile with Hyprland and a source-pinned Caelestia shell.",
   "manifest_version": "1",
-  "manifest_hash": "sha256:7ace2ec59bdc06ca843e7ecddd278758f9551e6303a563e4448dce06c835d25c",
+  "manifest_hash": "sha256:6eaba6bb06524c35bec352198b5c6fed3a7def555a36079612fe445447851aa2",
   "required_components": ["base-system", "networkmanager", "audio", "graphics", "portals", "polkit", "fonts", "hyprland", "caelestia-shell"],
   "optional_components": ["ssh"],
-  "packages": ["base", "linux", "linux-firmware", "sudo", "networkmanager", "man-db", "man-pages", "less", "vim", "zsh", "pipewire", "pipewire-pulse", "wireplumber", "mesa", "wayland", "xorg-xwayland", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "polkit", "fontconfig", "ttf-dejavu", "greetd", "tuigreet", "hyprland", "hyprpaper", "grim", "slurp", "mako", "quickshell", "git", "cmake", "ninja", "qt6-base", "qt6-declarative", "qt6-imageformats", "qt6-shadertools", "ddcutil", "libcava", "lm_sensors", "aubio", "libqalculate", "swappy", "fish", "ttf-material-symbols-variable", "ttf-rubik-vf", "ttf-cascadia-code-nerd"],
+  "packages": ["base", "linux", "linux-firmware", "sudo", "networkmanager", "man-db", "man-pages", "less", "vim", "zsh", "pipewire", "pipewire-pulse", "wireplumber", "mesa", "wayland", "xorg-xwayland", "xdg-desktop-portal", "xdg-desktop-portal-gtk", "polkit", "fontconfig", "ttf-dejavu", "greetd", "greetd-tuigreet", "hyprland", "hyprpaper", "kitty", "fuzzel", "grim", "slurp", "mako", "quickshell", "git", "cmake", "ninja", "gcc", "qt6-base", "qt6-declarative", "qt6-imageformats", "qt6-shadertools", "ddcutil", "cava", "lm_sensors", "aubio", "libqalculate", "swappy", "fish", "ttf-material-symbols-variable", "inter-font", "ttf-cascadia-code-nerd"],
   "services": ["NetworkManager.service", "greetd.service"],
   "configuration_templates": ["locale", "keyboard", "timezone", "hostname", "sudoers", "audio", "greetd", "hyprland", "caelestia"],
   "graphical_session": true,
-  "caelestia_source": {"repository": "https://github.com/caelestia-dots/shell", "commit": "e04a9d3fd8b24e106f0972204dd8e7683ac017a8"}
+  "caelestia_source": {"repository": "https://github.com/caelestia-dots/shell", "commit": "a788c432d9274a123c113eed6d28a241ddfc2cdd"}
 }

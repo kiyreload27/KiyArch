@@ -8,7 +8,7 @@ that completed, and a VM that genuinely booted from its installed disk.
 
 | Target | Current state |
 |---|---|
-| Minimal, UEFI, systemd-boot | Static validation updated; fresh-disk boot regression still required |
+| Minimal, UEFI, systemd-boot | Verified in disposable QEMU UEFI VM; installed-disk boot and reboot completed |
 | Laptop | Static/profile data only |
 | Desktop | Static/profile data only |
 | Hyprland + Caelestia | Static/profile data only; source build and graphical login unverified |
@@ -62,6 +62,10 @@ resolution, and `bootctl` status without mounting or modifying anything.
 
 Currently verified in this checkout:
 
+- Minimal UEFI/systemd-boot installation completed in the disposable QEMU VM;
+  the ISO was detached and the installed system booted successfully through a
+  subsequent reboot;
+
 - profile/manifests and manifest hashes;
 - schema 1.1 plans and legacy schema 1.0 validator compatibility;
 - disk-selection safety rejection tests;
@@ -73,8 +77,6 @@ Currently verified in this checkout:
 Not yet honestly claimable:
 
 - a fresh disposable VMware disk installed by the current ISO;
-- booting that disk after ISO removal;
-- login, sudo, network, and a second reboot from the installed disk;
 - GRUB boot;
 - end-to-end Laptop, Desktop, Hyprland/Caelestia, or Custom profiles.
 

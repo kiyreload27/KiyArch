@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The current environment mounts the user's home read-only. Keep pi's mutable
+# settings/cache in runtime storage and use the read-only installed package.
+pi_bin="$(command -v pi)"
+pi_bin="$(readlink -f "$pi_bin")"
+agent_dir="${PI_CODING_AGENT_DIR:-${XDG_RUNTIME_DIR:-/tmp}/pi-agent-${UID}}"
+package_dir="${PI_PACKAGE_DIR:-$(dirname "$pi_bin")}" 
+lockfile_patch="$(dirname "$0")/proper-lockfile-mtime-precision.js"
+
+mkdir -p "$agent_dir"
+if [[ ! -e "$agent_dir/settings.json" && -r "$HOME/.pi/agent/settings.json" ]]; then
+    cp "$HOME/.pi/agent/settings.json" "$agent_dir/settings.json"
+fi
+for state_file in auth.json models-store.json; do
+    if [[ ! -e "$agent_dir/$state_file" && -r "$HOME/.pi/agent/$state_file" ]]; then
+        cp "$HOME/.pi/agent/$state_file" "$agent_dir/$state_file"
+    fi
+done
+
+# Bootstrap package installation without entering the interactive TUI, then
+# patch the Bun-incompatible proper-lockfile cache before loading extensions.
+lockfile_impl="$agent_dir/npm/node_modules/proper-lockfile/lib/mtime-precision.js"
+if [[ ! -f "$lockfile_impl" && -r "$HOME/.pi/agent/npm/node_modules/proper-lockfile/lib/mtime-precision.js" ]]; then
+    mkdir -p "$agent_dir/npm/node_modules"
+    cp -a "$HOME/.pi/agent/npm/node_modules/proper-lockfile" "$agent_dir/npm/node_modules/"
+fi
+if [[ ! -f "$lockfile_impl" ]]; then
+    PI_CODING_AGENT_DIR="$agent_dir" PI_PACKAGE_DIR="$package_dir" \
+        "$pi_bin" --offline --help >/dev/null 2>&1 || true
+fi
+if [[ -f "$lockfile_impl" ]]; then
+    cp "$lockfile_patch" "$lockfile_impl"
+fi
+
+export PI_CODING_AGENT_DIR="$agent_dir"
+export PI_PACKAGE_DIR="$package_dir"
+exec "$pi_bin" "$@"

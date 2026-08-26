@@ -21,6 +21,9 @@ installer work without creating a separate incompatible distribution.
 
 The current development ISO provides:
 
+- the original **Midnight Forge** visual identity across the BIOS boot menu,
+  GRUB menu, MOTD, tty1 menu, and installer headings; its palette, typography,
+  composition, and voice are documented in `docs/IDENTITY.md`;
 - the `kiyarch-help` command and KiyArch MOTD;
 - the read-only `kiyarch-install` planner, which creates a validated JSON
   installation plan without executing any disk or package operation;
@@ -59,7 +62,9 @@ kiyarch-install --export-plan /run/kiyarch/install-plan.json
 The tty1 session opens a local-only KiyArch menu; SSH and manually opened
 shells are unaffected. The planner always presents Minimal, Laptop, Desktop,
 Hyprland + Caelestia, and Custom profiles. Profile manifests are versioned
-JSON data under `iso/airootfs/usr/local/share/kiyarch/profiles`.
+JSON data under `iso/airootfs/usr/local/share/kiyarch/profiles`. The Hyprland +
+Caelestia profile installs the Midnight Forge Hyprland, Kitty, Fuzzel, and
+Caelestia presets plus an original KiyArch wallpaper.
 
 The planner emits schema `1.1`, resolves packages from official Arch
 repositories, verifies the pinned Caelestia source, and never changes a disk.
@@ -71,15 +76,16 @@ password. It recollects disk identity, requires two exact confirmations, and
 runs post-install validation.
 
 Support status is intentionally conservative: Minimal UEFI/systemd-boot is
-the current end-to-end milestone and remains `Static-tests-only` until a fresh
-disposable VM has booted from its installed disk twice. Laptop, Desktop,
-Hyprland + Caelestia, and Custom are `Static-tests-only`; GRUB is `Deferred`
+now `Verified` after a disposable QEMU UEFI VM installed the system, booted
+without the ISO, and completed a subsequent reboot. Laptop, Desktop,
+Hyprland + Caelestia, and Custom remain `Static-tests-only`; GRUB is `Deferred`
 and legacy BIOS installation is `Deferred`.
 
 It lists device, size, model, transport, removable state, read-only state,
 current partition-table metadata, and warnings before selection. Legacy BIOS,
 missing disks, read-only disks, unsafe metadata, unsupported current partition
-tables, and disks too small for the preview are rejected. The selected disk is
+tables, and disks smaller than 16 GiB are rejected before any destructive
+operation. The selected disk is
 re-scanned immediately before the plan is written. Export requires the exact
 confirmation `CREATE PLANNER-ONLY PLAN`; removable media additionally require
 `I UNDERSTAND THIS IS REMOVABLE MEDIA`.
@@ -143,8 +149,8 @@ KiyArch 0.0.x focuses on:
 - safe disk selection
 - reproducible ISO builds
 
-The fixed-layout executor is implemented with explicit final validation, but a
-successful installation or boot is not claimed until the disposable-VM
-regression passes. This is not a claim of compatibility with every physical
-desktop, laptop, GPU, or firmware combination. Encryption, swap, Btrfs, LVM, RAID, multi-disk, BIOS
+The fixed-layout executor is implemented with explicit final validation, and
+its Minimal UEFI disposable-VM regression has passed. This is not a claim of
+compatibility with every physical desktop, laptop, GPU, or firmware
+combination. Encryption, swap, Btrfs, LVM, RAID, multi-disk, BIOS
 installation, AUR, arbitrary repositories, and custom layouts remain deferred.

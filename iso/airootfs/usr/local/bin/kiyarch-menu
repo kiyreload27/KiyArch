@@ -5,6 +5,17 @@ set -u
 [[ "$(tty 2>/dev/null || true)" == /dev/tty1 ]] || exit 0
 [[ -z "${SSH_CONNECTION:-}" && -z "${SSH_TTY:-}" ]] || exit 0
 
+UI_LIB=/usr/local/lib/kiyarch-ui.sh
+if [[ -r "$UI_LIB" ]]; then
+    # shellcheck source=../lib/kiyarch-ui.sh
+    source "$UI_LIB"
+else
+    KIY_UI_RESET='\033[0m'; KIY_UI_BOLD='\033[1m'; KIY_UI_EMBER='\033[33m'; KIY_UI_DIM='\033[2m'
+    kiyarch_ui_banner() { printf '%bKiyArch // Midnight Forge%b\n\n' "$KIY_UI_EMBER$KIY_UI_BOLD" "$KIY_UI_RESET"; }
+    kiyarch_ui_rule() { printf '%b------------------------------------------------%b\n' "$KIY_UI_DIM" "$KIY_UI_RESET"; }
+    kiyarch_ui_key() { printf '%b[%s]%b' "$KIY_UI_EMBER$KIY_UI_BOLD" "$1" "$KIY_UI_RESET"; }
+fi
+
 run_installer() {
     local answer plan=/run/kiyarch/install-plan.json
     kiyarch-install --export-plan "$plan" || return
@@ -19,9 +30,19 @@ run_installer() {
 
 while :; do
     clear 2>/dev/null || true
-    printf '\033[36m\033[1mKiyArch Live Environment\033[0m\n\n'
-    printf '  1) Start KiyArch installer\n  2) Hardware report\n  3) Network status\n  4) SSH status\n  5) Installation guide\n  6) Open rescue shell\n  7) Reboot\n  8) Power off\n\n'
-    read -r -p 'Choose an option (q opens a shell): ' choice || exit 0
+    kiyarch_ui_banner
+    printf '%bLIVE ENVIRONMENT%b  Arch Linux · x86_64\n' "$KIY_UI_DIM" "$KIY_UI_RESET"
+    kiyarch_ui_rule
+    printf '  '; kiyarch_ui_key 1; printf ' Install KiyArch\n'
+    printf '  '; kiyarch_ui_key 2; printf ' Inspect hardware\n'
+    printf '  '; kiyarch_ui_key 3; printf ' Check network\n'
+    printf '  '; kiyarch_ui_key 4; printf ' Check SSH access\n'
+    printf '  '; kiyarch_ui_key 5; printf ' Read installation guide\n'
+    printf '  '; kiyarch_ui_key 6; printf ' Open rescue shell\n'
+    printf '  '; kiyarch_ui_key 7; printf ' Restart system\n'
+    printf '  '; kiyarch_ui_key 8; printf ' Power off\n'
+    kiyarch_ui_rule
+    read -r -p 'Select [1-8] · q shell: ' choice || exit 0
     case "$choice" in
         1) run_installer;; 2) kiyarch-hw;; 3) kiyarch-network;; 4) kiyarch-ssh;;
         5) Installation_guide;; 6|q|Q) exec bash --noprofile --norc -i;;

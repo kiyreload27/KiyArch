@@ -43,8 +43,13 @@ ARCH="$KIYARCH_ARCH"
 FIRMWARE="$KIYARCH_FIRMWARE"
 VIRT=none; VM_TECHNOLOGY=none
 if have systemd-detect-virt; then
-    VIRT="$(systemd-detect-virt 2>/dev/null || printf none)"
-    VM_TECHNOLOGY="$(systemd-detect-virt --vm 2>/dev/null || printf none)"
+    # systemd-detect-virt prints "none" but exits non-zero on bare metal.
+    # Do not append a fallback string to that output, or the report becomes
+    # "none\\nnone" and is misclassified as a virtual machine.
+    VIRT="$(systemd-detect-virt 2>/dev/null || true)"
+    VM_TECHNOLOGY="$(systemd-detect-virt --vm 2>/dev/null || true)"
+    VIRT="${VIRT:-none}"
+    VM_TECHNOLOGY="${VM_TECHNOLOGY:-none}"
 fi
 if [[ "$VM_TECHNOLOGY" != none && -n "$VM_TECHNOLOGY" ]]; then
     MACHINE_TYPE=virtual_machine

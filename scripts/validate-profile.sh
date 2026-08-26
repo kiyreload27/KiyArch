@@ -41,10 +41,24 @@ for required in \
     "$BIN_DIR/kiyarch-diagnose" \
     "$PROFILE_DIR/airootfs/usr/local/lib/kiyarch-hardware.sh" \
     "$PROFILE_DIR/airootfs/usr/local/lib/kiyarch-profiles.sh" \
+    "$PROFILE_DIR/airootfs/usr/local/lib/kiyarch-ui.sh" \
+    "$PROFILE_DIR/airootfs/usr/local/share/kiyarch/midnight-forge/wallpaper.png" \
+    "$PROFILE_DIR/airootfs/usr/local/share/kiyarch/midnight-forge/hypr/hyprland.conf" \
+    "$PROFILE_DIR/airootfs/usr/local/share/kiyarch/midnight-forge/hypr/hyprpaper.conf" \
+    "$PROFILE_DIR/airootfs/usr/local/share/kiyarch/midnight-forge/kitty/kitty.conf" \
+    "$PROFILE_DIR/airootfs/usr/local/share/kiyarch/midnight-forge/fuzzel/fuzzel.ini" \
+    "$PROFILE_DIR/airootfs/usr/local/share/kiyarch/midnight-forge/caelestia/shell.json" \
     "$PROFILE_DIR/airootfs/root/.bash_profile" \
     "$PROFILE_DIR/airootfs/root/.zprofile"; do
     check_file "$required"
 done
+
+if ! grep -Fq '["/usr/local/lib/kiyarch-ui.sh"]="0:0:644"' "$PROFILE_FILE"; then
+    error "Midnight Forge UI library has no explicit ISO ownership/permission entry"
+fi
+if ! grep -Fq 'MIDNIGHT FORGE' "$PROFILE_DIR/airootfs/usr/local/lib/kiyarch-ui.sh"; then
+    error "Midnight Forge console identity is missing"
+fi
 
 if ! grep -Fq 'exec /usr/local/bin/kiyarch-menu' "$PROFILE_DIR/airootfs/root/.zprofile"; then
     error "zsh login profile does not hand tty1 to kiyarch-menu"
@@ -63,7 +77,7 @@ if ! grep -Eq '^root:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:/usr/bin/zsh$' "$PROFILE_DIR/
 fi
 
 if [[ -L "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants/sshd.service" ]]; then
-    [[ "$(readlink "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants/sshd.service")" == /usr/lib/systemd/system/sshd.service ]] || \
+    [[ "$(readlink "$PROFILE_DIR/airootfs/etc/systemd/system/multi-user.target.wants/sshd.service")" == /usr/lib/systemd/system/sshd.service ]] ||
         error "sshd.service enablement symlink has an unexpected target"
 else
     error "sshd.service enablement entry is not a symlink"
@@ -85,6 +99,14 @@ for manifest in "${profile_manifests[@]}"; do
     done
     grep -Eq '"manifest_version"[[:space:]]*:[[:space:]]*"1"' "$manifest" || error "profile manifest version is not 1: ${manifest##*/}"
     grep -Eq '"manifest_hash"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' "$manifest" || error "profile manifest hash is invalid: ${manifest##*/}"
+    declared_hash="$(sed -nE 's/^[[:space:]]*"manifest_hash"[[:space:]]*:[[:space:]]*"(sha256:[0-9a-f]{64})"[,]?[[:space:]]*$/\1/p' "$manifest" | head -n1)"
+    actual_hash="$(awk 'index($0, "manifest_hash") == 0' "$manifest" | sha256sum | awk '{print "sha256:" $1}')"
+    [[ "$declared_hash" == "$actual_hash" ]] || error "profile manifest hash does not match its payload: ${manifest##*/}"
+done
+
+for package in hyprland hyprpaper kitty fuzzel quickshell; do
+    grep -Eq "\"$package\"" "$PROFILE_DIR/airootfs/usr/local/share/kiyarch/profiles/hyprland-caelestia.json" ||
+        error "Midnight Forge desktop package is missing from Hyprland + Caelestia profile: $package"
 done
 
 mapfile -t duplicate_packages < <(awk 'NF && $1 !~ /^#/ { print $1 }' "$PACKAGES_FILE" | sort | uniq -d)

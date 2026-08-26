@@ -54,6 +54,8 @@ if (-not (Test-Path $Vars)) { Copy-Item $VarsTemplate $Vars }
 $Args = @(
     '-name', 'KiyArch-Minimal-UEFI',
     '-machine', 'q35',
+    # Explicitly disable QEMU audio input/output, including microphone capture.
+    '-audiodev', 'driver=none,id=noaudio',
     '-m', '4096',
     '-smp', '2',
     '-drive', "if=pflash,format=raw,readonly=on,file=$Code",

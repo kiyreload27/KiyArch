@@ -19,6 +19,10 @@ kiyarch_first_nonempty() {
             return
         fi
     done
+    # Keep reports/schema fields populated when every hardware source is
+    # unavailable. Callers should get a stable value rather than an empty
+    # string after all of the useful candidates were rejected.
+    printf 'unknown'
 }
 
 kiyarch_json_escape() {

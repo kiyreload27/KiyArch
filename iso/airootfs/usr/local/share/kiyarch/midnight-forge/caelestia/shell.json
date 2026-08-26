@@ -1,0 +1,10 @@
+{
+  "paths": {
+    "wallpaperDir": "~/Pictures/Wallpapers"
+  },
+  "appearance": {
+    "rounding": {
+      "scale": 0.8
+    }
+  }
+}

@@ -66,17 +66,35 @@ else
     error 'pacstrap validation assumes the wrong systemd path'
 fi
 
-if grep -Fq 'useradd -m -U -G wheel' "$BIN_DIR/kiyarch-execute"; then
-    pass 'installer creates a private primary group for home ownership'
+if grep -Fq 'useradd -m -U -G wheel' "$BIN_DIR/kiyarch-execute" && \
+   grep -Fq "stat -c '%u:%g'" "$BIN_DIR/kiyarch-execute" && \
+   grep -Fq 'home_uid="$(arch-chroot' "$BIN_DIR/kiyarch-execute" && \
+   grep -Fq 'etc/skel/.zshrc' "$BIN_DIR/kiyarch-execute"; then
+    pass 'installer creates users, validates installed IDs, and seeds zsh startup state'
 else
-    error 'installer does not explicitly create the user primary group'
+    error 'installer user creation or ownership/startup validation is incomplete'
 fi
 
-if grep -Fq 'pacman -Sw --noconfirm --needed --disable-download-timeout' "$BIN_DIR/kiyarch-execute" && \
-   grep -Fq 'pacstrap -K -c' "$BIN_DIR/kiyarch-execute"; then
-    pass 'package downloads are preflighted and reused by pacstrap'
+if grep -Fq 'Package availability preflight passed' "$BIN_DIR/kiyarch-execute" && \
+   grep -Fq 'pacstrap -K "$ROOT_MOUNT"' "$BIN_DIR/kiyarch-execute" && \
+   ! grep -Fq 'pacstrap -K -c' "$BIN_DIR/kiyarch-execute"; then
+    pass 'package availability is preflighted and downloads use the target filesystem'
 else
-    error 'package download preflight/cache reuse is missing'
+    error 'target-local package download handling is missing'
+fi
+
+if grep -Fq '[[ "$USER_SHELL" == fish ]] && REQUESTED_PACKAGES+=(fish)' "$INSTALLER"; then
+    pass 'selected fish shell is added to the requested package set'
+else
+    error 'selected fish shell can be installed without its package'
+fi
+
+if grep -Fq 'build_effective_services' "$BIN_DIR/kiyarch-execute" && \
+   grep -Fq 'package_requested openssh' "$BIN_DIR/kiyarch-execute" && \
+   grep -Fq '[[ "$GRAPHICAL" == true ]] && add_effective_service greetd.service' "$BIN_DIR/kiyarch-execute"; then
+    pass 'custom profile services follow the effective session and package set'
+else
+    error 'custom profile service composition is incomplete'
 fi
 
 post_line="$(grep -n '^    post_validate$' "$BIN_DIR/kiyarch-execute" | tail -n1 | cut -d: -f1)"
@@ -184,6 +202,7 @@ expect_selection_rejected() {
 expect_selection_rejected 'read-only disk' 'STORAGE_READONLY=(1)'
 expect_selection_rejected 'ambiguous metadata' 'STORAGE_METADATA=(ambiguous)'
 expect_selection_rejected 'legacy MBR partition table' 'STORAGE_PTTYPE=(dos)'
+expect_selection_rejected 'undersized disk' 'STORAGE_SIZE=(8 GiB); STORAGE_SIZE_BYTES=(8589934592)'
 
 if rg -n '(^|[;&|[:space:]])(parted|sgdisk|fdisk|wipefs|mkfs|mount|pacstrap)([[:space:]]|$)' "$INSTALLER" >/dev/null; then
     error 'planner source contains a forbidden disk operation'

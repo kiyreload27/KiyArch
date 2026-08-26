@@ -9,7 +9,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ISO_PATH="$ROOT_DIR/out/KiyArch-0.0.1-x86_64.iso"
 DISK_PATH="$ROOT_DIR/.qemu/kiyarch-minimal.qcow2"
 VARS_PATH="$ROOT_DIR/.qemu/kiyarch-minimal-vars.fd"
-MEMORY=4096
+# Keep the default modest so the VM is usable on an 8 GiB host.
+MEMORY=2048
 CPUS=2
 INSTALLED_ONLY=false
 RESET=false
@@ -17,9 +18,9 @@ RESET=false
 usage() {
     cat <<'USAGE'
 Usage:
-  scripts/qemu-minimal-test.sh [--iso PATH] [--disk PATH]
-  scripts/qemu-minimal-test.sh --installed [--disk PATH]
-  scripts/qemu-minimal-test.sh --reset [--iso PATH] [--disk PATH]
+  scripts/qemu-minimal-test.sh [--memory MiB] [--iso PATH] [--disk PATH]
+  scripts/qemu-minimal-test.sh --installed [--memory MiB] [--disk PATH]
+  scripts/qemu-minimal-test.sh --reset [--memory MiB] [--iso PATH] [--disk PATH]
 
 The default mode boots a fresh disposable 30 GiB qcow2 disk with the ISO.
 After installation, stop QEMU and run with --installed to boot the disk
@@ -30,6 +31,7 @@ USAGE
 
 while (($#)); do
     case "$1" in
+        --memory) (($# >= 2)) || { usage >&2; exit 2; }; MEMORY=$2; shift 2 ;;
         --iso) (($# >= 2)) || { usage >&2; exit 2; }; ISO_PATH=$2; shift 2 ;;
         --disk) (($# >= 2)) || { usage >&2; exit 2; }; DISK_PATH=$2; shift 2 ;;
         --installed) INSTALLED_ONLY=true; shift ;;
@@ -67,6 +69,8 @@ fi
 QEMU_ARGS=(
     -name KiyArch-Minimal-UEFI
     -machine q35
+    # Explicitly disable QEMU audio input/output, including microphone capture.
+    -audiodev driver=none,id=noaudio
     -m "$MEMORY"
     -smp "$CPUS"
     -drive "if=pflash,format=raw,readonly=on,file=$CODE_FIRMWARE"
