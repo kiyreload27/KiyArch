@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Safe regression tests for the planner milestone. No test invokes a disk,
+# Safe regression tests for the installer. No test invokes a disk,
 # filesystem, mount, or package-changing operation.
 set -u
 
@@ -15,7 +15,7 @@ ERRORS=0
 error() { printf 'ERROR: %s\n' "$1" >&2; ERRORS=$((ERRORS + 1)); }
 pass() { printf 'PASS: %s\n' "$1"; }
 
-printf 'Testing KiyArch planner milestone...\n'
+printf 'Testing KiyArch installer...\n'
 
 for script in "$BIN_DIR/kiyarch-hw" "$INSTALLER" "$VALIDATOR" "$BIN_DIR/kiyarch-menu" "$BIN_DIR/kiyarch-execute" "$BIN_DIR/kiyarch-diagnose" "$ROOT_DIR/scripts/qemu-minimal-test.sh" "$ROOT_DIR/iso/airootfs/usr/local/lib/kiyarch-hardware.sh"; do
     bash -n "$script" || error "Bash syntax failed: ${script#"$ROOT_DIR/"}"
@@ -36,6 +36,22 @@ if grep -Fq 'set -Eeuo pipefail' "$BIN_DIR/kiyarch-execute" && \
     pass 'executor fail-fast and partition invocation'
 else
     error 'executor fail-fast or partition invocation is missing'
+fi
+
+if grep -Fq 'kiyarch-execute --plan "$plan"' "$BIN_DIR/kiyarch-menu" && \
+   ! grep -Fq 'EXECUTE KIYARCH INSTALLATION' "$BIN_DIR/kiyarch-menu" && \
+   ! grep -Fq 'CREATE PLANNER-ONLY PLAN' "$INSTALLER"; then
+    pass 'guided flow moves from disk selection to the executor without redundant prompts'
+else
+    error 'guided flow still contains a redundant planner or executor handoff prompt'
+fi
+
+if grep -Fq 'FINAL INSTALLATION CHECK' "$BIN_DIR/kiyarch-execute" && \
+   grep -Fq 'Proceed with erasing this disk and installing KiyArch? [y/N]' "$BIN_DIR/kiyarch-execute" && \
+   ! grep -Fq 'ERASE THIS DISK' "$BIN_DIR/kiyarch-execute"; then
+    pass 'executor presents one clear final erase confirmation'
+else
+    error 'executor confirmation UX is not the single y/N prompt'
 fi
 
 if grep -Fq '"base_profile"' "$INSTALLER" && grep -Fq 'PROFILE_APPLY_ID' "$BIN_DIR/kiyarch-execute"; then
@@ -75,6 +91,13 @@ else
     error 'installer user creation or ownership/startup validation is incomplete'
 fi
 
+if grep -Fq "printf 'LANG=%s\\n' \"\$LOCALE\" > \"\$ROOT_MOUNT/etc/locale.conf\"" "$BIN_DIR/kiyarch-execute" && \
+   grep -Fq "sed -n 's/^LANG=//p' \"\$ROOT_MOUNT/etc/locale.conf\"" "$BIN_DIR/kiyarch-execute"; then
+    pass 'locale.conf is written and validated as a shell-compatible LANG assignment'
+else
+    error 'locale.conf is not written or validated as a LANG assignment'
+fi
+
 if grep -Fq 'Package availability preflight passed' "$BIN_DIR/kiyarch-execute" && \
    grep -Fq 'pacstrap -K "$ROOT_MOUNT"' "$BIN_DIR/kiyarch-execute" && \
    ! grep -Fq 'pacstrap -K -c' "$BIN_DIR/kiyarch-execute"; then
@@ -95,6 +118,14 @@ if grep -Fq 'build_effective_services' "$BIN_DIR/kiyarch-execute" && \
     pass 'custom profile services follow the effective session and package set'
 else
     error 'custom profile service composition is incomplete'
+fi
+
+if grep -Fq 'CUSTOM_DISK=false' "$ROOT_DIR/scripts/qemu-minimal-test.sh" && \
+   grep -Fq 'VARS_PATH="${DISK_PATH%.qcow2}.vars.fd"' "$ROOT_DIR/scripts/qemu-minimal-test.sh" && \
+   grep -Fq 'CUSTOM_DISK=true' "$ROOT_DIR/scripts/qemu-minimal-test.sh"; then
+    pass 'custom QEMU disks receive an isolated UEFI variable store'
+else
+    error 'custom QEMU disks can share the default UEFI variable store'
 fi
 
 post_line="$(grep -n '^    post_validate$' "$BIN_DIR/kiyarch-execute" | tail -n1 | cut -d: -f1)"

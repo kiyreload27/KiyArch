@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# KiyArch milestone 1: read-only installation-plan generator.
-# This command intentionally has no installation executor.
+# KiyArch installation planner.
+# It prepares and validates the internal plan; the menu hands it to the
+# separate executor after the user reviews the installation summary.
 set -u
 
 BOLD="\033[1m"; CYAN="\033[33m"; YELLOW="\033[33m"; GREEN="\033[32m"; RED="\033[31m"; RESET="\033[0m"
@@ -66,7 +67,7 @@ Usage: kiyarch-install [--export-plan PATH] [--help]
 
 Launch the terminal KiyArch installation planner. The planner requires
 explicit profile, disk, and account selection, verifies official packages,
-and exports a planner_only JSON plan only after typed confirmation.
+and exports a validated planner_only JSON plan for the executor.
 USAGE
 }
 
@@ -312,7 +313,7 @@ partition_suffix() {
 print_preview() {
     local root_bytes=$((STORAGE_SIZE_BYTES[SELECTED_INDEX] - EFI_SIZE_BYTES)) suffix
     suffix="$(partition_suffix)"
-    section 'Final plan preview'
+    section 'Installation summary'
     item 'Selected disk:' "${STORAGE_DEVICE[$SELECTED_INDEX]}"
     item 'Partition table:' 'GPT (planned)'
     printf '  1) %s%s1  1 GiB  FAT32  EFI System Partition  /boot/efi\n' "${STORAGE_DEVICE[$SELECTED_INDEX]}" "$suffix"
@@ -325,8 +326,9 @@ print_preview() {
     item 'Keyboard/hostname:' "$KEYBOARD / $HOSTNAME_VALUE"
     item 'Network:' 'NetworkManager enabled'
     item 'Encryption:' 'disabled; not part of this layout'
-    item 'Export path:' "$EXPORT_PATH"
-    printf '\n%bThis is a plan only. It will not partition, format, mount, install, or modify the selected disk.%b\n' "$YELLOW" "$RESET"
+    item 'Plan status:' 'Validated before installation'
+    printf '\n%bReview the summary above. Nothing has been changed yet.%b\n' "$YELLOW" "$RESET"
+    printf '%bThe installer will re-check this disk and ask once before erasing it.%b\n' "$YELLOW" "$RESET"
 }
 
 recheck_selected_disk() {
@@ -465,8 +467,5 @@ if [[ "${STORAGE_REMOVABLE[$SELECTED_INDEX]}" == yes ]]; then
     read -r removable_confirmation || fail 'removable-media confirmation was not provided'
     [[ "$removable_confirmation" == 'I UNDERSTAND THIS IS REMOVABLE MEDIA' ]] || { printf 'Plan export cancelled. No target disk changes were made.\n'; exit 0; }
 fi
-printf '\nType %bCREATE PLANNER-ONLY PLAN%b to export this exact plan, or anything else to cancel: ' "$BOLD" "$RESET"
-read -r confirmation || fail 'confirmation was not provided'
-[[ "$confirmation" == 'CREATE PLANNER-ONLY PLAN' ]] || { printf 'Plan export cancelled. No target disk changes were made.\n'; exit 0; }
 recheck_selected_disk
 export_plan

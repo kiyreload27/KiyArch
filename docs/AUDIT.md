@@ -23,7 +23,8 @@ that completed, and a VM that genuinely booted from its installed disk.
   SSH/non-tty sessions, and uses `exec` to avoid a relaunch loop. The menu's
   `q`/rescue path still opens a normal shell.
 - `kiyarch-execute` defined `partition_devices` but did not call it before
-  formatting. The call is now explicit after the destructive confirmations.
+  formatting. The call is now explicit after the final destructive
+  confirmation.
 - The executor previously used only `set -u`. It now uses
   `set -Eeuo pipefail` with an error trap and an unmistakable incomplete
   installation message.
@@ -42,6 +43,9 @@ that completed, and a VM that genuinely booted from its installed disk.
   generic loop. Minimal therefore enables only `NetworkManager.service`.
 - Custom plans now record `base_profile` so future execution can reproduce the
   selected composition.
+- The guided installer now moves directly from disk selection and a readable
+  installation summary to the executor. The executor rechecks disk identity
+  and uses one final `y/N` erase confirmation.
 
 ## Final validation now required before success
 
@@ -83,8 +87,9 @@ Not yet honestly claimable:
 ## Required next regression
 
 Build a new ISO, boot a fresh UEFI VM with a known disposable virtual disk,
-select Minimal, complete both confirmations, and inspect the executor's eight
-validation lines. Power off, detach the ISO, boot the virtual disk, then check:
+select Minimal, accept the final `y/N` erase confirmation, and inspect the
+executor's eight validation lines. Power off, detach the ISO, boot the virtual
+disk, then check:
 
 ```bash
 lsblk

@@ -9,6 +9,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ISO_PATH="$ROOT_DIR/out/KiyArch-0.0.1-x86_64.iso"
 DISK_PATH="$ROOT_DIR/.qemu/kiyarch-minimal.qcow2"
 VARS_PATH="$ROOT_DIR/.qemu/kiyarch-minimal-vars.fd"
+CUSTOM_DISK=false
 # Keep the default modest so the VM is usable on an 8 GiB host.
 MEMORY=2048
 CPUS=2
@@ -33,13 +34,24 @@ while (($#)); do
     case "$1" in
         --memory) (($# >= 2)) || { usage >&2; exit 2; }; MEMORY=$2; shift 2 ;;
         --iso) (($# >= 2)) || { usage >&2; exit 2; }; ISO_PATH=$2; shift 2 ;;
-        --disk) (($# >= 2)) || { usage >&2; exit 2; }; DISK_PATH=$2; shift 2 ;;
+        --disk) (($# >= 2)) || { usage >&2; exit 2; }; DISK_PATH=$2; CUSTOM_DISK=true; shift 2 ;;
         --installed) INSTALLED_ONLY=true; shift ;;
         --reset) RESET=true; shift ;;
         --help|-h) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
 done
+
+# Keep each explicitly selected disposable disk paired with its own UEFI
+# variable store. Sharing the default store can leak boot entries between
+# independent regression runs.
+if [[ "$CUSTOM_DISK" == true ]]; then
+    if [[ "$DISK_PATH" == *.qcow2 ]]; then
+        VARS_PATH="${DISK_PATH%.qcow2}.vars.fd"
+    else
+        VARS_PATH="${DISK_PATH}.vars.fd"
+    fi
+fi
 
 command -v qemu-system-x86_64 >/dev/null || { printf 'qemu-system-x86_64 is required\n' >&2; exit 1; }
 command -v qemu-img >/dev/null || { printf 'qemu-img is required\n' >&2; exit 1; }

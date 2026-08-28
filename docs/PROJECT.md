@@ -68,12 +68,14 @@ Caelestia presets plus an original KiyArch wallpaper.
 
 The planner emits schema `1.1`, resolves packages from official Arch
 repositories, verifies the pinned Caelestia source, and never changes a disk.
-The separate executor is invoked explicitly with
+The local tty1 menu passes the validated plan directly to the separate
+executor, which can also be invoked explicitly with
 `kiyarch-execute --plan /run/kiyarch/install-plan.json` (or `--dry-run`). It
 supports only UEFI/GPT, one 1 GiB FAT32 EFI partition, remaining ext4 root,
 no swap, no encryption, NetworkManager, a named sudo user, and a locked root
-password. It recollects disk identity, requires two exact confirmations, and
-runs post-install validation.
+password. It recollects disk identity, shows one final readable installation
+summary, asks for a single `y/N` erase confirmation, and runs post-install
+validation.
 
 Support status is intentionally conservative: Minimal UEFI/systemd-boot is
 now `Verified` after a disposable QEMU UEFI VM installed the system, booted
@@ -85,10 +87,9 @@ It lists device, size, model, transport, removable state, read-only state,
 current partition-table metadata, and warnings before selection. Legacy BIOS,
 missing disks, read-only disks, unsafe metadata, unsupported current partition
 tables, and disks smaller than 16 GiB are rejected before any destructive
-operation. The selected disk is
-re-scanned immediately before the plan is written. Export requires the exact
-confirmation `CREATE PLANNER-ONLY PLAN`; removable media additionally require
-`I UNDERSTAND THIS IS REMOVABLE MEDIA`.
+operation. The selected disk is re-scanned immediately before the plan is
+written and again by the executor immediately before confirmation. Removable
+media additionally require `I UNDERSTAND THIS IS REMOVABLE MEDIA`.
 
 The output is versioned JSON with `schema_version: "1.1"` and these stable
 sections: `source_hardware`, `target_disk`, `firmware_policy`,

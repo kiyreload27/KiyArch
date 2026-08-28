@@ -182,14 +182,19 @@ recollect_target() {
 }
 
 confirm_target() {
-    local expected answer
-    expected="I CONFIRM $TARGET ${STORAGE_SIZE[$TARGET_INDEX]}"
-    printf '\n%bFINAL TARGET%b\n  Device: %s\n  Size: %s\n  Model: %s\n  Profile: %s\n' "$YELLOW" "$RESET" "$TARGET" "${STORAGE_SIZE[$TARGET_INDEX]}" "${STORAGE_MODEL[$TARGET_INDEX]}" "$(kiyarch_profile_field "$PROFILE_ID" display_name)"
-    printf '\nThis creates GPT, erases the disk, and creates one FAT32 EFI and one ext4 root partition.\n'
-    read -r -p "Type exactly '$expected': " answer || fail 'device confirmation was not provided'
-    [[ "$answer" == "$expected" ]] || fail 'device-and-size confirmation did not match'
-    read -r -p 'Type exactly ERASE THIS DISK to acknowledge the destructive operation: ' answer || fail 'destructive confirmation was not provided'
-    [[ "$answer" == 'ERASE THIS DISK' ]] || fail 'destructive confirmation did not match'
+    local answer
+    printf '\n%bFINAL INSTALLATION CHECK%b\n' "$YELLOW" "$RESET"
+    printf '  Device:  %s\n  Size:    %s\n  Model:   %s\n  Profile: %s\n' \
+        "$TARGET" "${STORAGE_SIZE[$TARGET_INDEX]}" "${STORAGE_MODEL[$TARGET_INDEX]}" "$(kiyarch_profile_field "$PROFILE_ID" display_name)"
+    printf '\nThis will erase the disk and create:\n'
+    printf '  1) 1 GiB FAT32 EFI System Partition mounted at /boot/efi\n'
+    printf '  2) Remaining space as an ext4 root partition mounted at /\n'
+    printf '\n%bNothing has been written yet.%b\n' "$YELLOW" "$RESET"
+    read -r -p 'Proceed with erasing this disk and installing KiyArch? [y/N]: ' answer || fail 'installation confirmation was not provided'
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        printf 'Installation cancelled. No target disk changes were made.\n'
+        exit 0
+    fi
 }
 
 partition_devices() {
@@ -256,7 +261,7 @@ install_system() {
     genfstab -U "$ROOT_MOUNT" >> "$ROOT_MOUNT/etc/fstab"
     [[ -s "$ROOT_MOUNT/etc/fstab" ]] || fail 'genfstab did not create fstab'
     mkdir -p "$ROOT_MOUNT/etc"
-    printf '%s\n' "$LOCALE" > "$ROOT_MOUNT/etc/locale.conf"
+    printf 'LANG=%s\n' "$LOCALE" > "$ROOT_MOUNT/etc/locale.conf"
     printf '%s\n' "$HOSTNAME_VALUE" > "$ROOT_MOUNT/etc/hostname"
     mkdir -p "$ROOT_MOUNT/etc/vconsole.conf.d"
     printf 'KEYMAP=%s\n' "$KEYBOARD" > "$ROOT_MOUNT/etc/vconsole.conf"
@@ -439,7 +444,7 @@ post_validate() {
 
     step=$((step + 1)); printf '[%d/8] Locale/network ............. ' "$step"
     grep -Eq "^[[:space:]]*${LOCALE//./\\.}[[:space:]]+UTF-8[[:space:]]*$" "$ROOT_MOUNT/etc/locale.gen" || fail 'requested locale is not enabled'
-    [[ "$(cat "$ROOT_MOUNT/etc/locale.conf")" == "$LOCALE" && "$(cat "$ROOT_MOUNT/etc/hostname")" == "$HOSTNAME_VALUE" ]] || fail 'locale or hostname validation failed'
+    [[ "$(sed -n 's/^LANG=//p' "$ROOT_MOUNT/etc/locale.conf")" == "$LOCALE" && "$(cat "$ROOT_MOUNT/etc/hostname")" == "$HOSTNAME_VALUE" ]] || fail 'locale or hostname validation failed'
     grep -Eq "^KEYMAP=${KEYBOARD}$" "$ROOT_MOUNT/etc/vconsole.conf" || fail 'keyboard layout validation failed'
     locale_expected="$(printf '%s' "$LOCALE" | tr '[:upper:]' '[:lower:]' | tr -d '.-')"
     locale_value="$(arch-chroot "$ROOT_MOUNT" locale -a 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '.-' | grep -Fx "$locale_expected" | head -n1 || true)"

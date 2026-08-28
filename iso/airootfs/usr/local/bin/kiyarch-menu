@@ -17,14 +17,9 @@ else
 fi
 
 run_installer() {
-    local answer plan=/run/kiyarch/install-plan.json
+    local plan=/run/kiyarch/install-plan.json
     kiyarch-install --export-plan "$plan" || return
-    printf '\nA validated plan is ready at %s.\n' "$plan"
-    read -r -p 'Type EXECUTE KIYARCH INSTALLATION to continue to the destructive executor, or anything else to return: ' answer || return
-    [[ "$answer" == 'EXECUTE KIYARCH INSTALLATION' ]] || {
-        printf 'Execution cancelled. The plan remains available at %s.\n' "$plan"
-        return
-    }
+    printf '\n%bStarting final installation check...%b\n' "$KIY_UI_DIM" "$KIY_UI_RESET"
     kiyarch-execute --plan "$plan"
 }
 
